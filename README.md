@@ -1,6 +1,6 @@
 # devstack — local dev stacks for the Omarchy bar
 
-[![CI](https://github.com/MeperDonas/omarchy-devstack/actions/workflows/ci.yml/badge.svg)](https://github.com/MeperDonas/omarchy-devstack/actions/workflows/ci.yml)
+[![CI](https://github.com/meperdev/omarchy-devstack/actions/workflows/ci.yml/badge.svg)](https://github.com/meperdev/omarchy-devstack/actions/workflows/ci.yml)
 
 One bar icon in the Omarchy bar (plus a menu section and a CLI) to lift, watch and
 drop the local stack of a project: docker services, dev servers, health checks
@@ -76,7 +76,7 @@ One command: the plugin carries the CLI and the example stacks inside the same
 clone, so the widget works as soon as it is enabled.
 
 ```bash
-omarchy plugin add https://github.com/MeperDonas/omarchy-devstack --enable
+omarchy plugin add https://github.com/meperdev/omarchy-devstack --enable
 devstack init my-app        # creates ~/.config/devstack/my-app.json from the example
 devstack my-app up          # once you edited dir + services
 ```
@@ -87,7 +87,7 @@ stack (`devstack demo up`, a python http.server) and `example`.
 Optional extras:
 
 ```bash
-git clone https://github.com/MeperDonas/omarchy-devstack.git && cd omarchy-devstack
+git clone https://github.com/meperdev/omarchy-devstack.git && cd omarchy-devstack
 ./install.sh --menu          # adds the Dev section to the Omarchy menu
 ./install.sh --project my-app   # points the widget at one project
 ```
@@ -437,7 +437,7 @@ desarrollo, health checks y el navegador, en orden.
 **Instalar.**
 
 ```bash
-omarchy plugin add https://github.com/MeperDonas/omarchy-devstack --enable
+omarchy plugin add https://github.com/meperdev/omarchy-devstack --enable
 devstack init mi-app        # crea ~/.config/devstack/mi-app.json desde el ejemplo
 devstack mi-app up
 ```
