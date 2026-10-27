@@ -65,7 +65,7 @@ and never touches a process it did not start.
 ## Requirements
 
 - Omarchy with plugin support (the bar widget is a `bar-widget` plugin). The CLI
-  alone also runs on plain Arch/Hyprland: bash, `jq`, `curl`, `ss` (iproute2).
+  alone also runs on plain Arch/Hyprland: bash, `jq`, `ss` (iproute2).
 - `docker` only if you declare docker services.
 - For docker without the `docker` group: `polkit` (the Omarchy dialog asks for
   the password) and/or `sudo`.

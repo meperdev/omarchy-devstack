@@ -217,9 +217,27 @@ port_owner() { load_listeners; printf '%s' "${LISTEN_PIDS[$1]:-}"; }
 
 # Los sondeos de la barra no pueden esperar 5 s por un servicio que escucha y
 # no contesta. 1 s alcanza para un health local; las acciones que esperan de
-# verdad usan 5 s explícitos en report_ready.
+# verdad usan 5 s explícitos en report_ready. Los health son HTTP plano (como
+# dice el README): se piden con /dev/tcp de bash, sin curl ni otra dependencia.
 http_code() {
-    curl -sS -o /dev/null --connect-timeout 1 -m "${2:-1}" -w '%{http_code}' "$1" 2>/dev/null \
+    local url=$1 wait=${2:-1} rest hostport host port path line
+    [[ $url == http://* ]] || { printf '000'; return 0; }
+    rest=${url#http://}
+    hostport=${rest%%/*}
+    if [[ $rest == */* ]]; then path=/${rest#*/}; else path=/; fi
+    host=${hostport%:*}
+    if [[ $hostport == *:* ]]; then port=${hostport##*:}; else port=80; fi
+    [[ $host =~ ^[A-Za-z0-9._-]+$ && $port =~ ^[0-9]+$ ]] || { printf '000'; return 0; }
+    path=${path// /%20}
+    exec 3<>"/dev/tcp/$host/$port" 2>/dev/null || { printf '000'; return 0; }
+    if ! printf 'GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n' "$path" "$host" >&3 2>/dev/null \
+        || ! IFS= read -r -t "$wait" line <&3; then
+        exec 3>&- 3<&- 2>/dev/null || true
+        printf '000'
+        return 0
+    fi
+    exec 3>&- 3<&- 2>/dev/null || true
+    [[ $line =~ ^HTTP/[0-9.]+[[:space:]]+([0-9]{3}) ]] && printf '%s' "${BASH_REMATCH[1]}" \
         || printf '000'
 }
 http_ok() { [[ "$(http_code "$1" "${2:-1}")" =~ ^[23] ]]; }

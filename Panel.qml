@@ -353,7 +353,7 @@ Panel {
 
   Process {
     id: probe
-    // `timeout`: si el CLI se traba (docker, un curl que no corta), el sondeo
+    // `timeout`: si el CLI se traba (docker, una espera que no corta), el sondeo
     // muere en vez de dejar el widget congelado para siempre.
     command: ["timeout", "15", "/bin/bash", "-lc", root.allMode
       ? cli + " all json"

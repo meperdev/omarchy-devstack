@@ -32,7 +32,7 @@ bin/devstack demo down
 ```
 
 No docker, no node, no Omarchy needed for that path: the CLI only requires bash,
-`jq`, `curl` and `ss` (iproute2), and the Omarchy-specific bits
+`jq` and `ss` (iproute2), and the Omarchy-specific bits
 (`omarchy-launch-browser`, `omarchy-sudo-docker`, `notify-send`) are optional
 and detected at runtime.
 

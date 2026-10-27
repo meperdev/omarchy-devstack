@@ -43,7 +43,7 @@ export DEVDATA_CONFIG="$XDG_CONFIG_HOME/devstack" DEVDATA_PROJECT=demo
     || { echo "el directorio del demo no quedó 0700" >&2; exit 1; }
 [[ ! -e $marker ]] \
     || { echo "el demo importó un módulo del cwd" >&2; exit 1; }
-curl -fsS "http://127.0.0.1:$port/" >/dev/null
+"$DEVSTACK" demo --running
 
 "$DEVSTACK" demo down >/dev/null
 printf '\033[1;32mdemo: todo bien\033[0m\n'
