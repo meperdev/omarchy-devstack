@@ -81,8 +81,11 @@ devstack init my-app        # creates ~/.config/devstack/my-app.json from the ex
 devstack my-app up          # once you edited dir + services
 ```
 
-Already included, no extra steps: the widget's menu button, the shipped `demo`
-stack (`devstack demo up`, a python http.server) and `example`.
+Already included, no extra steps: the widget's menu button (it runs
+`devstack menu --ensure <project>` before summoning, so a missing
+`dev.<project>` route is generated instead of opening Omarchy's root menu), the
+shipped `demo` stack (`devstack demo up`, a python http.server in an
+owner-only directory) and `example`.
 
 Optional extras:
 
@@ -111,7 +114,9 @@ Uninstall with `./uninstall.sh` (add `--keep-config` to keep your stacks).
 DEVDATA_CONFIG="$PWD/config" DEVDATA_PROJECT=demo bin/devstack demo up
 ```
 
-`config/demo.json` is a single `python3 -m http.server` on `:8080`.
+`config/demo.json` is a single `python3 -I -m http.server` on `:8080`, serving
+`~/.local/state/devstack/demo` (created `0700`; `-I` keeps the cwd out of
+`sys.path`).
 
 ## Point it at any repo
 
@@ -184,13 +189,19 @@ You never have to leave the bar: **click a row** in the popup to pin that projec
 widget stops following the terminal) and **Quitar el fijado** to go back. Pressing a
 button no longer closes the popup (you watch the lift happen; `closeAfterAction: true`
 in the widget entry brings the old behaviour back), and a row whose own ▶/⏻ button
-started something shows *levantando…* exactly like the big button does. While the
-finder is open the popup shows only the finder — no service chips and no project
-buttons competing for the screen. The pin is
-stored with `devstack use`, so it survives a shell restart and the CLI agrees with
-what the bar shows:
+started something shows the same spinner as the big button, without the row jumping.
+While the finder is open the popup shows only the finder — no service chips and no
+project buttons competing for the screen.
+
+The pin is its own state (`~/.config/devstack/pinned`), **not** the house project:
+pinning the bar does not change the CLI fallback, and unpinning does not erase your
+default. They are two separate commands:
 
 ```bash
+devstack pin            # which project the bar is showing (may be empty)
+devstack pin meperpos   # pin it in the bar; focus no longer changes the icon
+devstack pin --clear    # unpin: follow the terminal again
+
 devstack use            # which project is the house project
 devstack use meperpos   # make it this one
 devstack use --clear    # forget it: back to the focused terminal
@@ -227,30 +238,37 @@ point the whole widget at any CLI invocation with the `command` setting
 ### Every project at a glance
 
 ```bash
-devstack all status     # one line per project: up/total plus a per-service state
-devstack all json       # the same, machine-readable (what mode: all reads)
-devstack all up         # lift what is missing, project by project
-devstack all down       # stop everything
+devstack all status       # one line per project: up/total plus a per-service state
+devstack all json         # the same, machine-readable (what mode: all reads)
+devstack all up           # lift what is missing, project by project
+devstack all down         # stop every managed stack and clean orphan pidfiles
+devstack all down --force # also free declared ports held by stray processes
 ```
 
 `mode: all` in the widget turns the icon into an aggregate — the glyph plus `N/M`
 — and the popup into one row per project with **Levantar lo que falta** and
-**Bajar todo**. Only projects *you* declared count; the examples shipped with the
-plugin stay out.
+**Apagar todo**. The same **Apagar todo** button is in every project popup: it
+stops all your projects, including runtime folders whose config you already
+deleted, and only then frees declared ports (`--force`). It never kills another
+running devstack project behind its back: each project's own `down` handles it.
+Only projects *you* declared count; the examples shipped with the plugin stay out.
 
 In `auto` and `fixed` the same rows appear at the top of the popup as a **project
 selector**: the one being shown is in bold, a click on a row pins that project
 (the widget stops following the terminal; **Quitar el fijado** goes back), and the
 row's `▶`/`⏻` button lifts or drops just that project.
 
-Two of your projects declaring the same port is warned about in `devstack all status`,
-and the widget shows it under the service chips (`:3000 compartido con otro proyecto`)
-— the one listening may be the other project's process, so a stack can look "up" when
-what answers is its neighbour. The chips carry their port and mark `·ajeno` when the
-process answering is not devstack's, and a project row goes amber in that case instead
-of green.
+**Ports have an owner.** Every managed service leaves a claim with its project and
+PID (or container), and the process listening on a port is traced back to its
+working directory when there is no claim. A stack only counts as *up* when the
+process is its own: if `:3000` is answered by another project, the chip says
+`· lo tiene <project>` and the row goes red, not green.
 
-The way out is a port that devstack hands to the service, so two stacks can coexist:
+When you lift a project whose port is already in use by *another* project,
+devstack **moves the one you are lifting** to a free port, writes `port`, `url`,
+`health` and `cmd` in its config, and starts it there. The running project is
+never touched. Whichever stack starts second moves; if both are down nothing
+changes, so configs that never coincide stay as they are.
 
 ```bash
 devstack meperpos port web --auto     # pick a free port, write port/url/health/cmd
@@ -258,14 +276,22 @@ devstack meperpos port web --to 3050  # or a specific one
 devstack meperpos port web --dry-run  # show what it would change
 ```
 
-`--auto` skips ports declared by your other projects and ports in use, and `port`
-rewrites three things so the app actually listens where devstack looks: the `port`
-itself, `url`/`health` if they carried the old one, and the `cmd` — `npm run dev`
-becomes `npm run dev -- --port {port}`, which both Vite and Next understand. Devstack
-also exports `PORT` (and `DEVDATA_PORT`) to every process service, so a `{port}` in
-your command or a framework that reads `PORT` just works. For a docker service the
-host port comes from its compose, so `port` refuses and says so. The popup shows a
-**Mover el puerto :3000** button whenever there is a clash.
+`--auto` skips ports claimed or declared by your other projects and ports in use.
+`port` rewrites the `port`, `url`/`health` if they carried the old one, and the
+`cmd` — literals and `--port N` become `{port}`, and `npm run dev` becomes
+`npm run dev -- --port {port}`, which both Vite and Next understand. Devstack also
+exports `PORT` (and `DEVDATA_PORT`) to every process service. The popup still shows
+a **Mover el puerto :N** button for a clash you want to resolve by hand.
+
+**Docker is isolated per project.** `devstack` reads the compose file with
+`docker compose config`, keeps the same services, but runs it as
+`devstack-<project>`: no fixed `container_name`, and project-scoped networks and
+volumes. Two projects with a `postgres-db` and a `backend/docker-compose.yml` no
+longer share (or stop) the same container. If the declared host port is taken, the
+generated compose publishes the moved port instead. `devstack <p> compose-file <svc>`
+prints the generated file when you need to inspect it; the original compose is
+never modified. External volumes/networks are left alone because sharing them is
+explicit.
 
 If a service dies because its dependencies are missing (`next: command not found`,
 `vite: command not found`), devstack now says so (`[aviso] Parece que faltan
@@ -340,6 +366,7 @@ Any client that speaks MCP over stdio works the same way: the command is
 | `label` | what you see in the chips and in `status` |
 | `type` | `process` (default) or `docker` |
 | `dir` | service working dir, relative to `dir` |
+| `create` | create the service dir (`0700`) if it does not exist; the demo uses it |
 | `cmd` | command to run (`process`) — launched with `setsid`, logged to a pidfile |
 | `compose` / `container` | compose file and container name (`docker`) |
 | `port` | port that must open before the next service starts |
@@ -364,7 +391,14 @@ devstack <p> task <id>            # seed, migrate, studio, …
 devstack <p> up <id ...>          # lift only some services
 devstack <p> list                 # declared services and tasks
 devstack <p> menu                 # print the JSONC block for the Omarchy menu
+devstack <p> compose-file <svc>   # print the isolated compose used for a docker service
 devstack <p> --running | --up | --foreign   # guards for the menu
+
+devstack all down --force         # stop every project + stray holders of declared ports
+devstack pin [<p>|--clear]        # what the bar pins (independent from `devstack use`)
+devstack menu --install           # (re)write the omarchy-menu.jsonc block for all projects
+devstack menu --ensure <p>        # install only if the dev.<p> route is missing
+devstack menu --remove            # remove the devstack block from the menu
 ```
 
 `DEVDATA_CONFIG` (config dir), `DEVDATA_PROJECT` (default project),
@@ -408,9 +442,9 @@ graph LR
   W["bar plugin<br/>meperdonas.devstack<br/>(poll 5 s)"] -- "devstack json" --> S["~/.local/bin/devstack"]
   M["Omarchy menu<br/>(dev.* rows)"] -- "bash -lc" --> S
   T["terminal"] --> S
-  S --> PG[("docker compose")]
+  S --> PG[("docker compose<br/>devstack-PROJECT")]
   S --> BE["dev servers (setsid)"]
-  S -.-> RT["/run/user/$UID/devstack/<project>/<br/>*.log *.pid"]
+  S -.-> RT["/run/user/$UID/devstack/PROJECT/<br/>*.log *.pid *.claim *.compose.json"]
 ```
 
 ## Caveats
@@ -449,14 +483,16 @@ Omarchy: `./install.sh --menu`.
 Es un **plugin de Omarchy** (`bar-widget`): se instala con `omarchy plugin add`,
 se actualiza con `omarchy plugin update` y se configura desde los ajustes de
 Omarchy. Para probarlo sin docker ni node: `DEVDATA_CONFIG="$PWD/config"
-DEVDATA_PROJECT=demo bin/devstack demo up` (levanta un `python3 -m http.server`).
+DEVDATA_PROJECT=demo bin/devstack demo up` (levanta un `python3 -I -m
+http.server` en un directorio privado `0700`).
 Desinstalar: `./uninstall.sh`.
 
 **Sin que se cierre.** Darle a un botón ya no cierra el popup: ves la animación y el
 estado avanzar, y podés seguir tocando (`"closeAfterAction": true` en la entrada del
 widget recupera el comportamiento viejo). Y un proyecto cuyo ▶/⏻ de fila disparó algo
-muestra *levantando…* igual que el botón grande. Mientras el buscador está abierto el
-popup es sólo el buscador: sin chips de servicios ni botones del proyecto.
+muestra el mismo spinner que el botón grande, sin que el renglón se reacomode.
+Mientras el buscador está abierto el popup es sólo el buscador: sin chips de
+servicios ni botones del proyecto.
 
 **Guiarlo a mano.** La resolución es una cadena corta y cada paso se puede forzar:
 la **terminal que mirás** (`mode: auto`), el ajuste **`project`** del widget (viaja
@@ -464,27 +500,40 @@ como `--fallback`), el **proyecto de casa** (`devstack use <p>`, o sea el archiv
 `~/.config/devstack/default`, que también usa `devstack json` cuando hay varios
 proyectos y no pasás nombre) y, si no hay nada, el widget dice *Sin proyecto · elegí
 uno abajo* y lista tus proyectos. Sin salir de la barra: **un click en un renglón**
-fija ese proyecto y **Quitar el fijado** vuelve; el pin se guarda con `devstack use`,
-así sobrevive al reinicio del shell y el CLI queda de acuerdo con la barra
-(`devstack use`, `devstack use meperpos`, `devstack use --clear`). Para algo
+fija ese proyecto y **Quitar el fijado** vuelve. El pin es un archivo aparte
+(`devstack pin`, `devstack pin meperpos`, `devstack pin --clear`): fijar la barra
+**no** cambia tu proyecto de casa, y despinar no borra el `use`. Para algo
 permanente: `mode: fixed` + `project` en la entrada del widget, o apuntá el widget
 entero a cualquier invocación del CLI con el ajuste `command`.
 
-**Ojo con los puertos.** Si dos de tus proyectos declaran el mismo puerto,
-`devstack all status` lo avisa y el widget lo muestra bajo los chips (*:3000
-compartido con otro proyecto*): el que escucha puede ser el proceso del otro, así
-que un stack puede verse "arriba" cuando el que contesta es el vecino. Los chips
-llevan su puerto y marcan *·ajeno* cuando el proceso **no es de devstack**, y la
-fila del proyecto se pone ámbar en ese caso en vez de verde.
+**Los puertos tienen dueño.** Cada servicio gestionado deja un claim con su
+proyecto y PID (o contenedor), y el proceso que escucha se rastrea hasta su
+directorio cuando no hay claim. Un stack sólo cuenta como *arriba* si el proceso
+es suyo: si `:3000` lo contesta otro proyecto, el chip dice *· lo tiene <proyecto>*
+y la fila va en rojo, no en verde.
 
-La salida es un puerto que devstack le pasa al servicio, para que dos stacks
-convivan: `devstack meperpos port web --auto` (elige uno libre y reescribe
-`port`, `url`/`health` y el `cmd` → `npm run dev -- --port {port}`, que entienden
-vite y next), `--to 3050` para uno concreto, `--dry-run` para verlo antes.
-Devstack además exporta `PORT` (y `DEVDATA_PORT`) a cada servicio de proceso, así
-que `{port}` en el cmd o un framework que lea `PORT` funciona directo. En un
-servicio docker el puerto lo define su compose, así que `port` se niega y lo dice.
-El popup muestra un botón **Mover el puerto :3000** cuando hay choque.
+Cuando levantás un proyecto cuyo puerto ya usa **otro** proyecto, devstack
+**mueve el que estás levantando** a uno libre, escribe `port`, `url`, `health` y
+`cmd` en su config y lo arranca ahí. Al proyecto que ya estaba corriendo no lo
+toca. Se mueve el segundo; si los dos están abajo no cambia nada, así que dos
+configs que nunca coinciden quedan como están.
+
+`devstack meperpos port web --auto` (elige uno libre y reescribe `port`,
+`url`/`health` y el `cmd` → `npm run dev -- --port {port}`, que entienden vite y
+next), `--to 3050` para uno concreto, `--dry-run` para verlo antes. `--auto`
+también evita los puertos con claim o declarados por tus otros proyectos.
+Devstack exporta `PORT` (y `DEVDATA_PORT`) a cada servicio de proceso, así que
+`{port}` en el cmd o un framework que lea `PORT` funciona directo. El popup
+muestra **Mover el puerto :N** para resolver un choque a mano.
+
+**Docker aislado por proyecto.** Devstack lee el compose con `docker compose
+config`, conserva los mismos servicios, pero lo corre como `devstack-<proyecto>`:
+sin `container_name` fijo, con redes y volúmenes propios. Dos proyectos con un
+`postgres-db` y un `backend/docker-compose.yml` ya no comparten (ni bajan) el
+mismo contenedor. Si el puerto declarado está ocupado, el compose generado
+publica el puerto movido. `devstack <p> compose-file <svc>` imprime el archivo
+generado; el compose original nunca se modifica. Los volúmenes/redes `external`
+se dejan como están porque compartirlos es una decisión explícita.
 
 **Buscar en vez de esperar.** El botón *Buscar proyectos* del popup corre
 `devstack find`: recorre tus carpetas (`~/Projects` por defecto; `DEVDATA_SEARCH_ROOTS`
@@ -496,13 +545,16 @@ declarado lo levanta (y lo fija); en uno sin declarar, lo declara *y* lo levanta
 una terminal, así ves lo que propone el detector antes de que escriba nada.
 `devstack find --json` es lo que lee el widget.
 
-**Todos a la vista.** `devstack all status|json|up|down` resume tus proyectos
-(arriba/total por proyecto) y con `mode: all` el icono de la barra muestra el
-glifo + `N/M` y el popup una fila por proyecto con *Levantar lo que falta* y
-*Bajar todo*. En `auto` y `fixed` esas mismas filas son el **selector**: la que
-se está mostrando va en negrita, un click fija ese proyecto (el widget deja de
-seguir la terminal; *Quitar el fijado* vuelve) y su botón `▶`/`⏻` levanta o baja
-sólo ese proyecto.
+**Todos a la vista.** `devstack all status|json|up|down [--force]` resume tus
+proyectos (arriba/total por proyecto) y con `mode: all` el icono de la barra
+muestra el glifo + `N/M` y el popup una fila por proyecto con *Levantar lo que
+falta* y **Apagar todo**. Ese mismo botón está en el popup de cada proyecto: baja
+todos tus stacks, incluidos los runtime de configs que ya borraste, y recién
+después libera los puertos declarados (`--force`). No mata por atrás un proyecto
+devstack que esté corriendo: cada uno lo baja su propio `down`. En `auto` y
+`fixed` las filas son el **selector**: la que se está mostrando va en negrita, un
+click fija ese proyecto (el widget deja de seguir la terminal; *Quitar el fijado*
+vuelve) y su botón `▶`/`⏻` levanta o baja sólo ese proyecto.
 
 **Para los agentes (MCP).** `devstack-mcp` es un servidor MCP por stdio (bash +
 jq) con `list/status/here/scan/declare/up/down/logs`: omp, opencode, claude,
@@ -534,7 +586,8 @@ lee: no ejecuta el proyecto, no eleva permisos y no copia secretos del `.env`.
 
 **Configurar.** Un JSON por proyecto en `~/.config/devstack/<nombre>.json`
 (nombre, directorio y `services` con `id`, `label`, `type` (`process`/`docker`),
-`dir`, `cmd`, `port`, `health`, `url`, `wait`, `open`; más `tasks` opcionales).
+`dir`, `create`, `cmd`, `port`, `health`, `url`, `wait`, `open`; más `tasks`
+opcionales).
 Mirá la tabla de campos de arriba y `config/example.json`.
 
 **Usar.** `devstack` lista los proyectos; `devstack <p> up|down|restart|status|

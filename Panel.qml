@@ -75,8 +75,10 @@ Panel {
   // botón chico muestra lo mismo que el grande).
   property var startingProjects: []
   property var startingAt: ({})
+  property var startingAction: ({})
   // Proyecto fijado a mano: sin pin el widget sigue el foco de la terminal.
   property string pinned: ""
+  property real pinSetAt: 0
   // Firma de lo último aplicado: cada 5 s llega el mismo JSON y reasignar
   // `services`/`projects` recrea los delegados y sus animaciones de entrada.
   property string appliedSignature: ""
@@ -85,6 +87,9 @@ Panel {
   property var services: []
   property string openService: ""
   property string pending: ""
+  // "Apagar todo" no es el pending de un proyecto: se libera cuando `all json`
+  // dice que no queda ningún stack arriba, no cuando baja el proyecto actual.
+  property bool stoppingAll: false
   property int pendingSeconds: 0
   // Cuándo empezó la acción y qué dijo el CLI si falló: con eso el widget sabe
   // que una acción terminó, en vez de mostrar "levantando" hasta el timeout.
@@ -114,6 +119,11 @@ Panel {
     return n
   }
   readonly property bool everythingUp: projectsTotal > 0 && projects.every(function (p) { return p.allUp })
+  readonly property int projectsConflict: {
+    var n = 0
+    for (var i = 0; i < projects.length; i++) if ((projects[i].conflicts || 0) > 0) n++
+    return n
+  }
   // repo detectado pero sin declarar (se puede declarar con el detector)
   readonly property bool undeclared: loaded && !declared && repo !== ""
   // nada que mostrar (terminal fuera de cualquier repo)
@@ -155,6 +165,22 @@ Panel {
     return out
   }
   readonly property bool hasClash: !allMode && clashPorts.length > 0
+  // Puertos que AHORA tiene otro proyecto declarado: no son "arriba", aunque
+  // algo conteste en esa dirección. `up` los mueve solos al levantar.
+  readonly property var conflictServices: services.filter(function (s) { return s.conflict })
+  readonly property bool hasConflict: !allMode && conflictServices.length > 0
+  readonly property int firstConflictPort: conflictServices.length > 0 ? conflictServices[0].port
+    : clashPorts.length > 0 ? clashPorts[0] : 0
+
+  function rowTooltip(p) {
+    var parts = [p.name + " · " + p.up + "/" + p.total]
+    var svcs = p.services || []
+    for (var i = 0; i < svcs.length; i++) {
+      if (svcs[i].conflict) parts.push(":" + svcs[i].port + " " + root.t("ownedBy", { owner: svcs[i].owner }))
+    }
+    if (!root.allMode) parts.push(root.pinned === p.project ? root.t("clickToUnpin") : root.t("clickToPin"))
+    return parts.join(" · ")
+  }
 
   readonly property string missingText: {
     var faltan = []
@@ -165,12 +191,13 @@ Panel {
     return faltan.join(" + ")
   }
 
-  readonly property string stateKind: allMode ? (!loaded ? "error" : everythingUp ? "ok" : projectsUp > 0 ? "working" : "off")
+  readonly property string stateKind: allMode ? (!loaded ? "error" : projectsConflict > 0 ? "error" : everythingUp ? "ok" : projectsUp > 0 ? "working" : "off")
     : noProject ? "off"
     : undeclared ? "working"
     : !loaded ? "error"
     : starting ? "working"
     : stuck && pending === "" ? "error"
+    : hasConflict ? "error"
     : allUp ? "ok"
     : anyUp ? "working"
     : "off"
@@ -180,8 +207,10 @@ Panel {
     : colorOff
 
   readonly property string stateText: (allMode ? (!loaded ? t("noData")
+      : stoppingAll ? t("stoppingAll") + pendingSeconds + "s"
+      : projectsConflict > 0 ? t("projectsConflict", { n: projectsConflict })
       : everythingUp ? t("allUp") + projectsTotal
-      : projectsUp > 0 ? projectsUp + "/" + projectsTotal + " arriba"
+      : projectsUp > 0 ? projectsUp + "/" + projectsTotal + " " + t("upShort")
       : t("allStopped"))
     : noProject ? (root.showRows ? t("noProjectPick") : t("noProject"))
     : undeclared ? t("undeclared") + name
@@ -189,8 +218,9 @@ Panel {
     : failure !== "" ? t("failed") + failure
     : pending === "up" ? (pendingSeconds >= pendingTimeout ? t("didNotFinish")
         : t("lifting") + pendingSeconds + "s" + (stuck ? t("serviceNoAnswer") : ""))
-    : pending === "down" ? t("stopping") + pendingSeconds + "s"
+    : pending === "down" ? (stoppingAll ? t("stoppingAll") : t("stopping")) + pendingSeconds + "s"
     : stuck && pending === "" ? t("serviceNotResponding")
+    : hasConflict ? t("portConflict", { port: firstConflictPort, owner: conflictServices[0].owner })
     : allUp ? (services.every(function (s) { return s.health === "" || s.healthy }) ? t("up") : t("upCompiling"))
     : anyUp ? t("partial") + missingText
     // El chip dice de dónde salió el proyecto: del foco, de tu ajuste/casa
@@ -198,6 +228,7 @@ Panel {
     : t("stopped")) + (allMode || !declared ? "" : pinned !== "" ? t("originPinned") : fallbackUsed ? t("originDefault") : t("originFocus"))
 
   function svcColor(s) {
+    if (s.conflict) return colorError
     if (s.health !== "") return s.healthy ? colorOk : (s.up ? (stuck ? colorError : colorWorking) : colorOff)
     return s.port > 0 ? (s.up ? colorOk : colorOff) : (s.managed ? colorOk : colorOff)
   }
@@ -228,11 +259,28 @@ Panel {
 
   Process {
     id: langProbe
-    command: ["/bin/bash", "-lc", root.cli + " lang"]
+    command: ["timeout", "3", "/bin/bash", "-lc", root.cli + " lang"]
     stdout: StdioCollector { id: langOutput }
     onExited: {
       var value = String(langOutput.text || "").trim()
       root.lang = value === "es" ? "es" : "en"
+    }
+  }
+
+  // El pin vive en su propio archivo del CLI (`devstack pin`): no se mezcla con
+  // el proyecto de casa (`devstack use`). Se lee al arrancar para no esperar al
+  // primer sondeo y se vuelve a preguntar tras cada acción.
+  Process {
+    id: pinProbe
+    command: ["timeout", "3", "/bin/bash", "-lc", root.cli + " pin"]
+    stdout: StdioCollector { id: pinOutput }
+    onExited: {
+      var value = String(pinOutput.text || "").trim()
+      if (root.pinned !== value) {
+        root.pinned = value
+        root.appliedSignature = ""
+        refresh()
+      }
     }
   }
 
@@ -246,6 +294,7 @@ Panel {
   function refresh() { if (!probe.running) probe.running = true }
   function startPending(what) {
     root.pending = what
+    root.stoppingAll = false
     root.pendingSeconds = 0
     root.pendingAt = Date.now() / 1000
     root.failure = ""
@@ -289,16 +338,31 @@ Panel {
     runCommand(cli + projectArg + " " + argument)
   }
 
+  // Botón de pánico: baja todos los stacks gestionados y, con --force, también
+  // lo que haya quedado tomando los puertos declarados. No toca procesos de
+  // otros proyectos devstack (el CLI los protege): ésos los baja su propio
+  // `down`, que ya corre en el mismo `all down`.
+  function stopEverything() {
+    startPending("down")
+    root.stoppingAll = true
+    root.failure = ""
+    refreshTimer.restart()
+    root.runCommand(cli + " all down --force")
+    refreshList()
+  }
+
   Process {
     id: probe
-    command: ["/bin/bash", "-lc", root.allMode
+    // `timeout`: si el CLI se traba (docker, un curl que no corta), el sondeo
+    // muere en vez de dejar el widget congelado para siempre.
+    command: ["timeout", "15", "/bin/bash", "-lc", root.allMode
       ? cli + " all json"
-      : root.pinned !== "" ? cli + " " + root.pinned + " json"
+      : root.pinned !== "" ? cli + " " + shq(root.pinned) + " json"
       : root.mode === "fixed" ? cli + root.projectArg + " json"
       // El respaldo viaja como argumento: una sola pasada, sin segunda sonda.
       // Precedencia: la terminal que mirás → el ajuste `project` → el proyecto
       // de casa (`devstack use`). Todo en una sola llamada.
-      : cli + " here json --window" + (root.projectName !== "" ? " --fallback " + root.projectName : "") + " --default"]
+      : cli + " here json --window" + (root.projectName !== "" ? " --fallback " + shq(root.projectName) : "") + " --default"]
     stdout: StdioCollector { id: probeOutput }
     onExited: {
       var data = null
@@ -309,6 +373,9 @@ Panel {
       }
       if (!data) {
         root.loaded = false
+        // Si el pin apunta a un proyecto borrado, el sondeo no devuelve JSON:
+        // se relee el pin para limpiarlo en vez de quedar en "sin datos".
+        if (root.pinned !== "" && !pinProbe.running) pinProbe.running = true
         return
       }
       root.loaded = true
@@ -322,8 +389,15 @@ Panel {
         root.services = []
         root.name = "devstack"
         root.declared = true
+        if (root.stoppingAll && data.every(function (p) { return p.up === 0 })) {
+          root.stoppingAll = false
+          root.pending = ""
+        }
         if (root.pending === "up" && root.everythingUp) root.pending = ""
-        if (root.pending !== "" && root.pendingSeconds >= root.pendingTimeout) root.pending = ""
+        if (root.pending !== "" && root.pendingSeconds >= root.pendingTimeout) {
+          root.pending = ""
+          root.stoppingAll = false
+        }
       // Red de seguridad: si un servicio está arriba sin responder hace rato, la
       // acción no está progresando; se suelta el "levantando" (la acción sigue,
       // sólo se libera la UI).
@@ -356,6 +430,18 @@ Panel {
       }
       // `fallback` lo informa el propio CLI cuando usó el respaldo del ajuste.
       root.fallbackUsed = data.fallback === true
+      // Pin externo (cambiado con `devstack pin` desde la terminal): se adopta
+      // si el widget no tiene uno local. Si el archivo se vació afuera, se
+      // suelta después de 3 s (margen para el `bar.run` que escribe el click).
+      if (data.pinned) {
+        if (root.pinned === "" && (root.pinSetAt === 0 || Date.now() / 1000 - root.pinSetAt > 3)) {
+          root.pinned = data.pinned
+          root.appliedSignature = ""
+        }
+      } else if (root.pinned !== "" && Date.now() / 1000 - root.pinSetAt > 3) {
+        root.pinned = ""
+        root.appliedSignature = ""
+      }
       if (root.failure !== "" && root.pending === "") {
         // el aviso de error dura hasta la próxima acción o hasta que el estado
         // cambie solo (se limpia cuando ya no hay nada que reclamar)
@@ -372,22 +458,28 @@ Panel {
       }
       var unhealthy = root.services.some(function (s) { return s.health !== "" && s.up && !s.healthy })
       root.stuckPolls = unhealthy ? root.stuckPolls + 1 : 0
-      if (root.pending !== "" && root.pendingSeconds >= root.pendingTimeout) root.pending = ""
+      if (root.pending !== "" && root.pendingSeconds >= root.pendingTimeout) {
+        root.pending = ""
+        root.stoppingAll = false
+      }
       // Una acción termina cuando llega a su estado destino *posible*: lo que no
       // maneja devstack (procesos ajenos) no cuenta.
       if (root.pending === "up" && root.allUp) root.pending = ""
-      if (root.pending === "down") {
+      if (root.pending === "down" && !root.stoppingAll) {
         var gone = root.services.every(function (s) { return !s.up || !s.managed })
         if (gone && !root.services.some(function (s) { return s.type === "docker" && s.up })) root.pending = ""
       }
-      if (root.pending !== "" && root.pendingSeconds >= root.pendingTimeout) root.pending = ""
+      if (root.pending !== "" && root.pendingSeconds >= root.pendingTimeout) {
+        root.pending = ""
+        root.stoppingAll = false
+      }
     }
   }
 
   // Lista para el selector: `all json` al abrir el popup (y tras una acción).
   Process {
     id: listProbe
-    command: ["/bin/bash", "-lc", root.cli + " all json"]
+    command: ["timeout", "15", "/bin/bash", "-lc", root.cli + " all json"]
     stdout: StdioCollector { id: listOutput }
     onExited: {
       var data = null
@@ -397,6 +489,25 @@ Panel {
         data = null
       }
       if (!data || !data.length) return
+      // "Apagar todo" terminó cuando ningún proyecto tiene servicios arriba
+      // (o cuando cada `down` dejó su resultado, aunque alguno haya fallado).
+      if (root.stoppingAll) {
+        var allDown = data.every(function (p) { return p.up === 0 })
+        var reported = data.every(function (p) {
+          return p.lastResult && p.lastResult.action === "down"
+            && (p.lastResult.at || 0) + 2 >= root.pendingAt
+        })
+        if (allDown || reported) {
+          for (var k = 0; k < data.length; k++) {
+            if (data[k].lastResult && data[k].lastResult.ok === false) {
+              root.failure = data[k].lastResult.detail || root.t("failed")
+              break
+            }
+          }
+          root.stoppingAll = false
+          root.pending = ""
+        }
+      }
       // Las acciones disparadas desde una fila también terminan: se sueltan
       // cuando su estado llegó o cuando su último resultado es de esta corrida.
       var still = []
@@ -406,7 +517,10 @@ Panel {
         for (var j = 0; j < data.length; j++) if (data[j].project === name) { proj = data[j]; break }
         if (!proj) continue
         var lr = proj.lastResult
-        if (proj.up > 0 || (lr && (lr.at || 0) + 2 >= (root.startingAt[name] || 0))) continue
+        // "Terminó" es el estado destino, no cualquier progreso: una bajada de
+        // 3 a 2 servicios no puede soltar el spinner de la fila.
+        var done = (root.startingAction[name] || "up") === "down" ? proj.up === 0 : proj.allUp
+        if (done || (lr && (lr.at || 0) + 2 >= (root.startingAt[name] || 0))) continue
         still.push(name)
       }
       if (still.length !== root.startingProjects.length) root.startingProjects = still
@@ -420,7 +534,7 @@ Panel {
 
   Process {
     id: findProbe
-    command: ["/bin/bash", "-lc", root.cli + " find --json"]
+    command: ["timeout", "90", "/bin/bash", "-lc", root.cli + " find --json"]
     stdout: StdioCollector { id: findOutput }
     onRunningChanged: root.findRunning = running
     onExited: {
@@ -440,21 +554,25 @@ Panel {
     listProbe.running = true
   }
 
-  // Fijar/soltar un proyecto: el renglón se clickea y el widget deja de seguir
-  // el foco (o vuelve a seguirlo). El pin se guarda también en el CLI
-  // (`devstack use`), así sobrevive al reinicio del shell y el CLI queda de
-  // acuerdo con lo que muestra la barra.
+  // Fijar el proyecto que muestra la barra. Es un estado aparte del "proyecto
+  // de casa" (`devstack use`): fijar acá no cambia el fallback del CLI, y
+  // despinar no borra tu default. Se guarda con `devstack pin`, así el widget
+  // y el CLI coinciden sin mezclar las dos cosas.
   function pinProject(project) {
     if (root.allMode || !project) return
     root.pinned = project
-    bar.run("DEVDATA_NOTIFY=off " + cli + " use " + project)
+    root.pinSetAt = Date.now() / 1000
+    root.appliedSignature = ""
+    bar.run("DEVDATA_NOTIFY=off " + cli + " pin " + shq(project))
     refresh()
   }
 
   function unpinProject() {
     if (root.pinned === "") return
     root.pinned = ""
-    bar.run("DEVDATA_NOTIFY=off " + cli + " use --clear")
+    root.pinSetAt = Date.now() / 1000
+    root.appliedSignature = ""
+    bar.run("DEVDATA_NOTIFY=off " + cli + " pin --clear")
     refresh()
   }
 
@@ -470,15 +588,32 @@ Panel {
     return root.startingProjects.indexOf(project) >= 0
   }
 
-  function markStarting(project) {
+  function markStarting(project, action) {
     var at = root.startingAt
     at[project] = Date.now() / 1000
     root.startingAt = at
+    var acts = root.startingAction
+    acts[project] = action || "up"
+    root.startingAction = acts
     if (root.startingProjects.indexOf(project) < 0) {
       var list = root.startingProjects.slice()
       list.push(project)
       root.startingProjects = list
     }
+  }
+
+  // Acción disparada desde una fila. Tiene que entrar en el MISMO estado que el
+  // botón grande: el botón chico antes ejecutaba el comando y sólo cambiaba el
+  // texto de la fila, así que no mostraba spinner ni barra de progreso.
+  function runProjectAction(project, argument) {
+    if (!project) return
+    if (project === root.effectiveProject) {
+      if (argument === "down") startPending("down")
+      else if (argument === "up" || argument.indexOf("restart") === 0) startPending("up")
+      else startPending("")
+    }
+    root.markStarting(project, argument.indexOf("down") === 0 ? "down" : "up")
+    root.runCommand(cli + " " + shq(project) + " " + argument)
   }
 
   function findProjects() {
@@ -495,7 +630,7 @@ Panel {
     if (candidate.declared) {
       root.searching = false
       root.pinProject(candidate.project)
-      root.runCommand(cli + " " + shq(candidate.project) + " " + (candidate.up > 0 ? "down" : "up"))
+      root.runProjectAction(candidate.project, candidate.up > 0 ? "down" : "up")
       return
     }
     // La lista que estás mirando ya no vale: ese candidato dejó de estar sin
@@ -537,12 +672,13 @@ Panel {
       // Con el popup abierto, los renglones de proyectos también se refrescan
       // (si no, quedaban con el estado de cuando lo abriste: "1/3" con todo
       // levantado).
-      if (root.opened) root.refreshList()
+      if (root.opened || root.stoppingAll) root.refreshList()
     }
   }
 
   Component.onCompleted: {
     langProbe.running = true
+    pinProbe.running = true
     refresh()
   }
 
@@ -757,7 +893,9 @@ Panel {
 
           Item {
             width: parent.width
-            height: 22
+            height: 26
+
+            readonly property bool conflict: (modelData.conflicts || 0) > 0
 
             Rectangle {
               anchors.fill: parent
@@ -769,53 +907,80 @@ Panel {
               id: rowHover
               anchors.fill: parent
               hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
+              enabled: !root.allMode
+              cursorShape: root.allMode ? Qt.ArrowCursor : Qt.PointingHandCursor
               onClicked: root.togglePin(modelData.project)
+              onEntered: if (bar) bar.showTooltip(rowHover, root.rowTooltip(modelData))
+              onExited: if (bar) bar.hideTooltip(rowHover)
             }
 
             Row {
-            anchors.fill: parent
-            spacing: 6
-            Rectangle {
-              width: 7
-              height: 7
-              radius: 3.5
-              anchors.verticalCenter: parent.verticalCenter
-              // Ámbar si lo que responde no es de devstack: así no se confunde
-              // "alguien atiende el puerto" con "mi stack está arriba".
-              color: modelData.allUp ? (root.foreignCount(modelData) > 0 ? root.colorWorking : root.colorOk)
-                : (modelData.up > 0 ? root.colorWorking : root.colorOff)
-            }
-            Text {
-              text: modelData.name
-              width: parent.width - 100
-              elide: Text.ElideRight
-              color: bar ? bar.foreground : "white"
-              font.family: bar ? bar.fontFamily : "monospace"
-              font.pixelSize: 11
-              // El que se está mostrando (por foco o por pin) va en negrita.
-              font.bold: !root.allMode && modelData.project === root.resolvedProject
-              anchors.verticalCenter: parent.verticalCenter
-            }
-            Text {
-              text: root.isStarting(modelData.project) ? root.t("liftingRow") : modelData.up + "/" + modelData.total
-              color: modelData.allUp ? (root.foreignCount(modelData) > 0 ? root.colorWorking : root.colorOk)
-                : (modelData.up > 0 ? root.colorWorking : root.colorOff)
-              font.family: bar ? bar.fontFamily : "monospace"
-              font.pixelSize: 10
-              anchors.verticalCenter: parent.verticalCenter
-            }
-            // Un click por proyecto: levanta el que está abajo, baja el que está
-            // arriba (el icono dice cuál va a hacer).
-            ActionButton {
-              compact: true
-              icon: modelData.up > 0 ? "󰍃" : "󰐊"
-              enabled: !root.isStarting(modelData.project)
-              onTriggered: {
-                if (modelData.up === 0) root.markStarting(modelData.project)
-                root.runCommand(cli + " " + shq(modelData.project) + " " + (modelData.up > 0 ? "down" : "up"))
+              anchors.fill: parent
+              spacing: 6
+
+              Rectangle {
+                width: 7
+                height: 7
+                radius: 3.5
+                anchors.verticalCenter: parent.verticalCenter
+                // Rojo si el puerto lo tiene OTRO proyecto; ámbar si responde
+                // algo que no es de devstack.
+                color: conflict ? root.colorError
+                  : modelData.allUp ? (root.foreignCount(modelData) > 0 ? root.colorWorking : root.colorOk)
+                  : (modelData.up > 0 ? root.colorWorking : root.colorOff)
               }
-            }
+
+              // Pin fijo (ancho fijo para que las filas no salten al fijar).
+              Item {
+                width: 12
+                height: 12
+                anchors.verticalCenter: parent.verticalCenter
+                Text {
+                  anchors.centerIn: parent
+                  visible: !root.allMode && root.pinned === modelData.project
+                  text: "󰐃"
+                  color: root.colorWorking
+                  font.family: bar ? bar.fontFamily : "monospace"
+                  font.pixelSize: 12
+                }
+              }
+
+              Text {
+                text: modelData.name
+                width: parent.width - 7 - 12 - 42 - 26 - 24
+                elide: Text.ElideRight
+                color: bar ? bar.foreground : "white"
+                font.family: bar ? bar.fontFamily : "monospace"
+                font.pixelSize: 11
+                // El que se está mostrando (por foco o por pin) va en negrita.
+                font.bold: !root.allMode && modelData.project === root.resolvedProject
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                width: 42
+                horizontalAlignment: Text.AlignRight
+                // Ancho fijo y sólo "…" durante la acción: el renglón no se
+                // reacomoda (el corte visual que se veía al tocar el botón chico).
+                text: root.isStarting(modelData.project) ? "…" : modelData.up + "/" + modelData.total
+                color: conflict ? root.colorError
+                  : modelData.allUp ? (root.foreignCount(modelData) > 0 ? root.colorWorking : root.colorOk)
+                  : (modelData.up > 0 ? root.colorWorking : root.colorOff)
+                font.family: bar ? bar.fontFamily : "monospace"
+                font.pixelSize: 10
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              // Un click por proyecto: levanta el que está abajo, baja el que
+              // está arriba. Comparte el estado busy del botón grande.
+              ActionButton {
+                compact: true
+                icon: modelData.up > 0 ? "󰍃" : "󰐊"
+                busy: root.isStarting(modelData.project)
+                enabled: !root.isStarting(modelData.project)
+                anchors.verticalCenter: parent.verticalCenter
+                onTriggered: root.runProjectAction(modelData.project, modelData.up > 0 ? "down" : "up")
+              }
             }
           }
         }
@@ -948,7 +1113,15 @@ Panel {
         anchors.horizontalCenter: parent.horizontalCenter
         visible: root.allMode
         spacing: 8
-        ActionButton { wide: true; label: root.t("dropAll"); icon: "󰍃"; enabled: !root.starting && root.projectsUp > 0; onTriggered: root.runInTerminal(cli + " all down") }
+        ActionButton {
+          wide: true
+          label: root.t("stopEverything")
+          icon: "󰐥"
+          danger: true
+          busy: root.stoppingAll
+          enabled: !root.stoppingAll && root.projectsUp > 0
+          onTriggered: root.stopEverything()
+        }
       }
 
       // Un chip por servicio declarado en el JSON del proyecto.
@@ -965,7 +1138,8 @@ Panel {
 
           Chip {
             label: modelData.label + (modelData.port > 0 ? " :" + modelData.port : "")
-              + ((modelData.type !== "docker" && modelData.up && !modelData.managed) ? root.t("foreign") : "")
+              + (modelData.conflict ? root.t("ownedBy", { owner: modelData.owner }) : "")
+              + ((modelData.type !== "docker" && modelData.up && !modelData.managed && !modelData.conflict && !modelData.owner) ? root.t("foreign") : "")
             lit: modelData.health !== "" ? modelData.healthy : modelData.up
             accent: root.svcColor(modelData)
           }
@@ -973,11 +1147,13 @@ Panel {
       }
 
       Text {
-        visible: root.hasClash
+        visible: root.hasConflict || root.hasClash
         width: contentColumn.width
         horizontalAlignment: Text.AlignHCenter
-        text: "󰀦 :" + root.clashPorts.join(" · :") + root.t("clashWarning")
-        color: root.colorWorking
+        text: root.hasConflict
+          ? "󰀦 " + root.t("portConflict", { port: root.firstConflictPort, owner: root.conflictServices[0].owner })
+          : "󰀦 :" + root.clashPorts.join(" · :") + root.t("clashWarning")
+        color: root.hasConflict ? root.colorError : root.colorWorking
         wrapMode: Text.WordWrap
         font.family: bar ? bar.fontFamily : "monospace"
         font.pixelSize: 10
@@ -985,14 +1161,14 @@ Panel {
 
       // La salida: le mueve el puerto a este proyecto (elige uno libre, lo
       // escribe en url/health/cmd y reinicia). En un terminal para que veas qué
-      // puerto eligió y qué reescribió.
+      // puerto eligió y qué reescribió. Al levantar, `up` ya lo hace solo.
       Row {
         anchors.horizontalCenter: parent.horizontalCenter
-        visible: root.hasClash
+        visible: root.hasConflict || root.hasClash
         spacing: 8
         ActionButton {
           wide: true
-          label: root.t("movePort") + (root.clashPorts[0] || "")
+          label: root.t("movePort") + root.firstConflictPort
           icon: "󰒓"
           enabled: !root.starting
           onTriggered: root.runInTerminal(cli + projectArg + " port --auto && " + cli + projectArg + " restart")
@@ -1021,8 +1197,39 @@ Panel {
         anchors.horizontalCenter: parent.horizontalCenter
         visible: root.declared && !root.allMode && !root.searching
         spacing: 8
-        ActionButton { label: root.t("restart"); icon: "󰜉"; enabled: root.anyUp && !root.starting; onTriggered: root.run("restart") }
-        ActionButton { label: root.t("menu"); icon: "󰒓"; enabled: true; onTriggered: root.runCommand("omarchy menu summon " + shq(root.effectiveProject !== "" ? "dev." + root.effectiveProject : "dev")) }
+        ActionButton {
+          label: root.t("restart")
+          icon: "󰜉"
+          busy: root.starting && root.pending === "up"
+          enabled: root.anyUp && !root.starting
+          onTriggered: root.run("restart")
+        }
+        ActionButton {
+          label: root.t("menu")
+          icon: "󰒓"
+          enabled: root.effectiveProject !== ""
+          // `--ensure` verifica que la ruta dev.<proyecto> exista y, si falta,
+          // instala el bloque. Sin eso, `omarchy menu summon` abría el menú
+          // raíz de Omarchy (el "se abre el menú de Omarchy" que se veía).
+          onTriggered: root.runCommand(cli + " menu --ensure " + shq(root.effectiveProject)
+            + " && omarchy menu summon " + shq("dev." + root.effectiveProject))
+        }
+      }
+
+      // Pánico: todos los proyectos, no sólo el de la barra.
+      Row {
+        anchors.horizontalCenter: parent.horizontalCenter
+        visible: root.declared && !root.allMode && !root.searching
+        spacing: 8
+        ActionButton {
+          wide: true
+          label: root.t("stopEverything")
+          icon: "󰐥"
+          danger: true
+          busy: root.stoppingAll
+          enabled: !root.stoppingAll && !root.starting
+          onTriggered: root.stopEverything()
+        }
       }
 
       // Repo reconocido pero sin declarar: se declara con el detector, en una
@@ -1089,34 +1296,74 @@ Panel {
     property string label
     property string icon: ""
     property bool enabled: true
+    property bool busy: false
     property bool wide: false
     property bool compact: false
+    property bool danger: false
     signal triggered()
     width: compact ? 26 : (wide ? root.contentWidth : Math.floor((root.contentWidth - 8) / 2))
     height: compact ? 22 : 54
-    radius: 2
-    color: enabled ? (buttonMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.18) : Qt.rgba(1, 1, 1, 0.10)) : Qt.rgba(1, 1, 1, 0.04)
-    border.color: enabled ? Qt.rgba(1, 1, 1, 0.28) : Qt.rgba(1, 1, 1, 0.10)
+    radius: 3
+    color: danger
+      ? Qt.rgba(root.colorError.r, root.colorError.g, root.colorError.b, buttonMouse.containsMouse && enabled ? 0.22 : 0.12)
+      : enabled
+        ? (buttonMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.18) : Qt.rgba(1, 1, 1, 0.10))
+        : Qt.rgba(1, 1, 1, 0.04)
+    border.color: danger && enabled
+      ? Qt.rgba(root.colorError.r, root.colorError.g, root.colorError.b, 0.55)
+      : enabled ? Qt.rgba(1, 1, 1, 0.28) : Qt.rgba(1, 1, 1, 0.10)
     border.width: 1
-    opacity: enabled ? 1 : 0.45
+    opacity: enabled || busy ? 1 : 0.45
 
     Column {
       anchors.centerIn: parent
       spacing: 2
-      Text {
+
+      Item {
         width: buttonRoot.compact ? buttonRoot.width : buttonRoot.width - 12
-        horizontalAlignment: Text.AlignHCenter
-        text: buttonRoot.icon
-        color: bar ? bar.foreground : "white"
-        font.family: bar ? bar.fontFamily : "monospace"
-        font.pixelSize: buttonRoot.compact ? 13 : 17
+        height: buttonRoot.compact ? 14 : 19
+
+        Text {
+          anchors.centerIn: parent
+          visible: !buttonRoot.busy
+          text: buttonRoot.icon
+          color: bar ? bar.foreground : "white"
+          font.family: bar ? bar.fontFamily : "monospace"
+          font.pixelSize: buttonRoot.compact ? 13 : 17
+        }
+
+        // Mismo "levantando" para el botón grande y el chico de cada fila.
+        Row {
+          anchors.centerIn: parent
+          visible: buttonRoot.busy
+          spacing: 3
+          Repeater {
+            model: 3
+            Rectangle {
+              width: 4
+              height: 4
+              radius: 2
+              color: danger ? root.colorError : (bar ? bar.foreground : "white")
+              opacity: 0.25
+              SequentialAnimation on opacity {
+                running: buttonRoot.busy
+                loops: Animation.Infinite
+                PauseAnimation { duration: index * 160 }
+                NumberAnimation { from: 0.25; to: 1; duration: 280; easing.type: Easing.InOutSine }
+                NumberAnimation { from: 1; to: 0.25; duration: 280; easing.type: Easing.InOutSine }
+                PauseAnimation { duration: (2 - index) * 160 }
+              }
+            }
+          }
+        }
       }
+
       Text {
         visible: !buttonRoot.compact
         width: buttonRoot.width - 12
         horizontalAlignment: Text.AlignHCenter
         text: buttonRoot.label
-        color: bar ? bar.foreground : "white"
+        color: danger && enabled ? root.colorError : (bar ? bar.foreground : "white")
         font.family: bar ? bar.fontFamily : "monospace"
         font.pixelSize: 10
         wrapMode: Text.NoWrap
@@ -1127,7 +1374,7 @@ Panel {
     MouseArea {
       id: buttonMouse
       anchors.fill: parent
-      enabled: parent.enabled
+      enabled: parent.enabled && !parent.busy
       hoverEnabled: true
       onClicked: parent.triggered()
     }

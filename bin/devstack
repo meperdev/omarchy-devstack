@@ -10,9 +10,10 @@
 # Uso:
 #   devstack                          lista los proyectos configurados
 #   devstack <p> [up]                 levanta todo y abre el navegador
-#                                     --force pisa lo ajeno que ocupe los puertos
+#                                     si otro proyecto tiene el puerto, mueve el
+#                                     de ESTE; --force además libera lo ajeno
 #   devstack <p> down                 baja los procesos y los servicios docker
-#                                     --keep-docker lo deja, --force mata lo ajeno
+#                                     --keep-docker lo deja, --force libera puertos
 #   devstack <p> restart [id...]      reinicia (todos o los ids dados)
 #   devstack <p> status               estado por servicio
 #   devstack <p> json                 estado como JSON (lo consume el widget de la barra)
@@ -22,6 +23,7 @@
 #   devstack <p> task <id>            corre una tarea declarada (seed, migrate, …)
 #   devstack <p> list                 servicios y tareas declarados
 #   devstack <p> menu                 imprime el bloque JSONC para el menú de Omarchy
+#   devstack <p> compose-file <svc>   imprime el compose aislado que usa `up`
 #   devstack <p> --running            exit 0 si todos los servicios con health responden
 #   devstack <p> --up                 exit 0 si todo escucha
 #   devstack <p> --foreign            exit 0 si algún puerto lo tiene un proceso ajeno
@@ -35,7 +37,10 @@
 #                                     que se pelean el mismo puerto
 #   devstack add <dir> [--name <n>]   declara el stack que propone `scan`
 #                                     (repetirlo sobre el mismo dir no rompe)
-#   devstack all [status|json|up|down]  todos TUS proyectos de una vez
+#   devstack all [status|json|up|down [--force]]
+#                                     todos TUS proyectos de una vez; `down` baja
+#                                     también los restos huérfanos y con --force
+#                                     libera los puertos declarados
 #   devstack here [cmd] [--window] [--fallback <p>] [--default]
 #                                     el proyecto de la terminal activa (--window) o del
 #                                     $PWD, y reenvía ahí cmd: status, up, down, logs…
@@ -45,6 +50,11 @@
 #   devstack use [<p>|--clear]        proyecto de casa: el que se usa cuando no hay
 #                                     otro (el widget lo usa si la terminal no está
 #                                     en ningún proyecto declarado)
+#   devstack pin [<p>|--clear|--show] proyecto fijado en la barra (ignora el foco);
+#                                     es independiente de `use`
+#   devstack menu --install|--ensure <p>|--remove
+#                                     instala/verifica/quita la sección dev.* del
+#                                     menú de Omarchy (el botón Menú usa --ensure)
 #
 # Overrides: DEVDATA_CONFIG (dir de configs) DEVDATA_PROJECT (proyecto por defecto)
 #            DEVDATA_NOTIFY=all|final|off  (avisos de escritorio; el widget usa final)
@@ -173,16 +183,45 @@ ensure_runtime() {
 
 # ---------------------------------------------------------------- sondas
 
-port_open() { ss -ltnH "sport = :$1" 2>/dev/null | grep -q .; }
-
-# PID dueño de un puerto (visible si el proceso es del mismo usuario). Siempre
-# termina en 0: un grep sin match no debe tumbar el script (set -e).
-port_owner() {
-    ss -ltnpH "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true
+# Una sola foto de `ss` por corrida: antes cada servicio (y cada proyecto de
+# `all json`) ejecutaba su propio `ss`, y el sondeo de la barra se iba en decenas
+# de procesos. Clave: puerto → pid (vacío si es de otro usuario).
+declare -A LISTEN_PIDS=()
+LISTEN_LOADED=""
+load_listeners() {
+    if [[ ${1:-} == force ]]; then
+        LISTEN_PIDS=()
+        LISTEN_LOADED=""
+    elif [[ -n $LISTEN_LOADED ]]; then
+        return 0
+    fi
+    LISTEN_LOADED=1
+    local line local_addr port pid
+    while IFS= read -r line; do
+        local_addr=$(awk '{print $4}' <<<"$line")
+        port=${local_addr##*:}
+        [[ $port =~ ^[0-9]+$ ]] || continue
+        pid=$(grep -oE 'pid=[0-9]+' <<<"$line" 2>/dev/null | head -1 | cut -d= -f2 || true)
+        LISTEN_PIDS[$port]=${pid:-}
+    done < <(ss -ltnpH 2>/dev/null || true)
 }
 
-http_code() { curl -sS -o /dev/null -m "${2:-2}" -w '%{http_code}' "$1" 2>/dev/null || printf '000'; }
-http_ok() { [[ "$(http_code "$1" "${2:-2}")" =~ ^[23] ]]; }
+port_open() { load_listeners; [[ -n ${LISTEN_PIDS[$1]+x} ]]; }
+# Para las esperas: el servicio acaba de arrancar, la foto anterior ya no vale.
+port_open_fresh() { load_listeners force; [[ -n ${LISTEN_PIDS[$1]+x} ]]; }
+
+# PID dueño de un puerto (visible si el proceso es del mismo usuario). Siempre
+# termina en 0: sin match no debe tumbar el script (set -e).
+port_owner() { load_listeners; printf '%s' "${LISTEN_PIDS[$1]:-}"; }
+
+# Los sondeos de la barra no pueden esperar 5 s por un servicio que escucha y
+# no contesta. 1 s alcanza para un health local; las acciones que esperan de
+# verdad usan 5 s explícitos en report_ready.
+http_code() {
+    curl -sS -o /dev/null --connect-timeout 1 -m "${2:-1}" -w '%{http_code}' "$1" 2>/dev/null \
+        || printf '000'
+}
+http_ok() { [[ "$(http_code "$1" "${2:-1}")" =~ ^[23] ]]; }
 
 # Un servicio que muere porque falta instalar dependencias es el error más común
 # al declarar un repo recién clonado; el log lo dice, así que se lo traducimos.
@@ -203,6 +242,99 @@ pid_of_file() {
     [[ $pid =~ ^[0-9]+$ ]] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
     printf '%s' "$pid"
+}
+
+# ---------------------------------------------------------------- propiedad
+# Un puerto tiene dueño, no sólo un proceso escuchando. Cada servicio deja un
+# claim con su proyecto y su pid (o contenedor); así `up`/`down` distinguen "mi
+# servicio", "el servicio de otro proyecto" y "un proceso suelto". Sin esto,
+# dos configs en :3001 se contestaban cruzado y bajar una dejaba la otra a
+# medias.
+
+svc_claimfile() { printf '%s/%s.claim' "$RUNTIME_DIR" "$1"; }
+
+write_claim() { # id puerto pid contenedor proyecto-compose
+    local id=$1 port=$2 pid=$3 container=$4 compose_project=$5 file tmp
+    ensure_runtime 2>/dev/null || return 0
+    mkdir -p "$RUNTIME_DIR" 2>/dev/null || return 0
+    file=$(svc_claimfile "$id")
+    tmp="$file.tmp.$$"
+    jq -nc --arg project "$CURRENT" --arg service "$id" --argjson port "${port:-0}" \
+        --arg pid "$pid" --arg container "$container" --arg compose_project "$compose_project" \
+        --argjson at "$(date +%s)" \
+        '{project:$project, service:$service, port:$port, pid:$pid, container:$container, compose_project:$compose_project, at:$at}' \
+        >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp"
+}
+
+clear_claim() { rm -f "$(svc_claimfile "$1")" 2>/dev/null || true; }
+
+claim_field() { # archivo campo
+    jq -r --arg k "$2" '.[$k] // empty' "$1" 2>/dev/null || true
+}
+
+# Puertos claimados por proyectos con el proceso todavía vivo. Los claims de
+# docker no tienen pid: se confían mientras el puerto siga abierto; al bajar el
+# stack se borran.
+declare -A CLAIM_PORT_PROJECT=()
+declare -A CLAIM_PORT_AT=()
+CLAIMS_LOADED=""
+load_claims() {
+    [[ -n $CLAIMS_LOADED ]] && return 0
+    CLAIMS_LOADED=1
+    local f port project pid at
+    for f in "$RUNTIME_BASE"/*/*.claim; do
+        [[ -r $f ]] || continue
+        port=$(claim_field "$f" port)
+        project=$(claim_field "$f" project)
+        pid=$(claim_field "$f" pid)
+        at=$(claim_field "$f" at)
+        [[ -n $port && -n $project ]] || continue
+        if [[ -n $pid ]]; then
+            kill -0 "$pid" 2>/dev/null || continue
+        fi
+        # Si quedó un claim viejo del mismo puerto (un contenedor que paraste a
+        # mano), gana el más reciente: es el que acaba de escribir su dueño.
+        [[ ${at:-0} =~ ^[0-9]+$ ]] || at=0
+        if [[ -z ${CLAIM_PORT_PROJECT[$port]:-} ]] || ((at >= ${CLAIM_PORT_AT[$port]:-0})); then
+            CLAIM_PORT_PROJECT[$port]=$project
+            CLAIM_PORT_AT[$port]=$at
+        fi
+    done
+}
+
+claim_project_for_port() { load_claims; printf '%s' "${CLAIM_PORT_PROJECT[$1]:-}"; }
+
+# Dueño de un puerto abierto: primero los claims (proceso o contenedor de un
+# proyecto devstack) y, si no hay, el cwd del proceso que escucha. Un `node`
+# lanzado a mano dentro de ~/Projects/MeperPOS/:3001 es de MeperPOS aunque no
+# tenga pidfile.
+port_owner_project() {
+    local port=$1 owner pid cwd
+    owner=$(claim_project_for_port "$port")
+    [[ -n $owner ]] && { printf '%s' "$owner"; return 0; }
+    pid=$(port_owner "$port")
+    [[ -n $pid && -d /proc/$pid ]] || return 1
+    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || return 1
+    [[ -n $cwd ]] || return 1
+    project_for_path "$cwd"
+}
+
+# Otro proyecto declarado que usa ese puerto (aunque esté abajo): sirve para no
+# volver a caer en la misma colisión la próxima vez.
+declared_project_for_port() {
+    local port=$1 p f
+    for p in $(list_user_projects); do
+        [[ $p == "$CURRENT" ]] && continue
+        f=$(project_file "$p") || continue
+        if jq -e --argjson port "$port" '[.services[]? | select(.port == $port)] | length > 0' \
+            "$f" >/dev/null 2>&1; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Resultado de la última acción con `up`/`down`/`restart`: el widget lo lee en
@@ -291,6 +423,53 @@ use_cmd() {
     mkdir -p "$USER_CONFIG_DIR"
     printf '%s\n' "$want" >"$f"
     ok "Proyecto de casa: $want (el widget lo usa cuando no reconoce la terminal)"
+}
+
+# El pin del widget es OTRA cosa que el proyecto de casa: `use` es el fallback
+# de `here`, mientras que `pin` obliga a la barra a mostrar ese proyecto aunque
+# el foco esté en otro. Antes el botón de fijar escribía `use`, así que fijar y
+# despinar cambiaban también el default del CLI. Ahora vive en su archivo.
+pin_file() { printf '%s/pinned' "$USER_CONFIG_DIR"; }
+
+pinned_project() {
+    local f name
+    f=$(pin_file)
+    [[ -r $f ]] || return 0
+    name=$(tr -d '\n\r' <"$f")
+    [[ -n $name ]] || return 0
+    if ! project_file "$name" >/dev/null 2>&1; then
+        rm -f "$f" 2>/dev/null || true
+        return 0
+    fi
+    printf '%s' "$name"
+}
+
+pin_cmd() {
+    local f want="${1:-}" cur
+    f=$(pin_file)
+    case $want in
+        --help | -h)
+            printf 'devstack pin [PROYECTO|--clear|--show]\n'
+            printf '  sin argumentos o --show  muestra el proyecto fijado\n'
+            printf '  PROYECTO                  lo fija en la barra (ignora el foco)\n'
+            printf '  --clear                   vuelve a seguir el foco\n'
+            return 0
+            ;;
+        --clear)
+            rm -f "$f"
+            ok "Sin proyecto fijado: la barra vuelve a seguir la terminal"
+            return 0
+            ;;
+        "" | --show)
+            cur=$(pinned_project)
+            [[ -n $cur ]] && printf '%s\n' "$cur"
+            return 0
+            ;;
+    esac
+    project_file "$want" >/dev/null || die "No existe el proyecto '$want' (busqué en ${CONFIG_DIRS[*]})"
+    mkdir -p "$USER_CONFIG_DIR"
+    printf '%s\n' "$want" >"$f"
+    ok "Proyecto fijado en la barra: $want"
 }
 
 # devstack find [DIR...] [--json] [--depth N]
@@ -542,26 +721,125 @@ docker_quiet() {
     fi
 }
 
-compose_up() {
+compose_source() {
     local id=$1 file
     file=$(svc_field "$id" compose)
     [[ -n $file ]] || die "El servicio docker '$id' necesita 'compose'"
     [[ $file == /* ]] || file="$DIR/$file"
+    printf '%s' "$file"
+}
+
+# Nombre de proyecto compose propio: dos stacks con un compose parecido (mismo
+# nombre de carpeta, mismo `container_name`) dejaban de compartir contenedor,
+# red y volumen. Ahora cada proyecto devstack tiene los suyos.
+compose_project_name() {
+    local name
+    name=$(printf '%s' "$CURRENT" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-')
+    printf 'devstack-%s' "${name:-project}"
+}
+
+compose_generated_file() { printf '%s/%s.compose.json' "$RUNTIME_DIR" "$1"; }
+compose_service_file() { printf '%s/%s.compose-service' "$RUNTIME_DIR" "$1"; }
+
+# Genera un compose equivalente al declarado, pero aislado:
+#   · proyecto devstack-<proyecto> (redes y volúmenes propios)
+#   · sin container_name fijo (dos proyectos no se pelean el nombre)
+#   · el primer puerto publicado del servicio pasa al puerto que declara devstack
+# `docker compose config` no habla con el daemon: no pide contraseña.
+ensure_compose_file() {
+    local id=$1 file gen svc container only json project port
+    file=$(compose_source "$id")
+    gen=$(compose_generated_file "$id")
+    project=$(compose_project_name)
+    container=$(svc_field "$id" container)
+    port=$(svc_port "$id")
+    mkdir -p "$RUNTIME_DIR"
+    chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+
+    command -v docker >/dev/null || die "Docker no está instalado"
+    json=$( cd "$DIR" && docker compose -f "$file" config --format json 2>/dev/null ) || {
+        die "No pude leer el compose de '$id' ($file)"
+    }
+    # Servicio del compose que corresponde a este servicio de devstack: por
+    # `container` (container_name del compose) o, si hay uno solo, ése.
+    svc=$(printf '%s' "$json" | jq -r --arg c "$container" '
+        if $c != "" then
+          ([.services | to_entries[] | select(.value.container_name == $c)][0].key // "")
+        else "" end')
+    if [[ -z $svc ]]; then
+        only=$(printf '%s' "$json" | jq -r '.services | keys | if length == 1 then .[0] else empty end')
+        if [[ -n $only ]]; then
+            svc=$only
+        elif [[ -n $container ]]; then
+            die "El container '$container' no está en $file (revisá 'container' en el config de $CURRENT)"
+        else
+            die "El compose de '$id' tiene varios servicios: declarale 'container' para saber cuál es"
+        fi
+    fi
+
+    printf '%s' "$json" | jq --arg name "$project" --arg svc "$svc" --argjson port "${port:-0}" '
+        .name = $name
+        | .services |= with_entries(
+            .value |= del(.container_name)
+            | if .key == $svc and $port > 0 then
+                .value.ports = ((.value.ports // []) | if length > 0 then
+                    .[0].published = ($port | tostring) | . else . end)
+              else . end
+          )
+        | .volumes = ((.volumes // {}) | with_entries(
+            if (.value.external // false) then . else .value.name = ($name + "_" + .key) end))
+        | .networks = ((.networks // {}) | with_entries(
+            if (.value.external // false) then . else .value.name = ($name + "_" + .key) end))
+      ' >"$gen" || die "No pude generar el compose aislado de '$id'"
+    chmod 600 "$gen" 2>/dev/null || true
+    printf '%s\n' "$svc" >"$(compose_service_file "$id")"
+}
+
+compose_up() {
+    local id=$1 project svc cid cname port
+    ensure_runtime
+    ensure_compose_file "$id"
+    project=$(compose_project_name)
+    svc=$(<"$(compose_service_file "$id")")
+    port=$(svc_port "$id")
     resolve_docker
-    ( cd "$DIR" && "${DOCKER[@]}" compose -f "$file" up -d )
+    ( cd "$DIR" && "${DOCKER[@]}" compose -p "$project" -f "$(compose_generated_file "$id")" up -d ) \
+        || die "docker compose up falló para $(svc_label "$id")"
+    # Nombre real del contenedor (sin container_name fijo lo pone compose):
+    # el claim es lo que usa el estado para no confundirlo con otro stack.
+    cid=$( cd "$DIR" && "${DOCKER[@]}" compose -p "$project" -f "$(compose_generated_file "$id")" ps -q "$svc" 2>/dev/null | head -1 )
+    cname=""
+    if [[ -n $cid ]]; then
+        cname=$("${DOCKER[@]}" inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##' | head -1)
+    fi
+    write_claim "$id" "$port" "" "$cname" "$project"
 }
 
 compose_down() {
-    local id=$1 file
-    file=$(svc_field "$id" compose)
-    [[ $file == /* ]] || file="$DIR/$file"
+    local id=$1 force=${2:-} project source
+    project=$(compose_project_name)
+    [[ -r $(compose_generated_file "$id") ]] || ensure_compose_file "$id"
     resolve_docker
-    ( cd "$DIR" && "${DOCKER[@]}" compose -f "$file" down )
+    ( cd "$DIR" && "${DOCKER[@]}" compose -p "$project" -f "$(compose_generated_file "$id")" down ) \
+        || die "docker compose down falló para $(svc_label "$id")"
+    # Un contenedor viejo, creado antes del aislamiento, no lleva las labels de
+    # devstack-<proyecto>. Sólo el apagado forzado lo limpia; el compose original
+    # nunca se modifica.
+    if [[ $force == force ]]; then
+        source=$(compose_source "$id")
+        log "Limpiando el compose sin aislar de $(svc_label "$id")..."
+        ( cd "$DIR" && "${DOCKER[@]}" compose -f "$source" down ) >/dev/null 2>&1 || true
+    fi
+    clear_claim "$id"
 }
 
 container_status() {
-    local id=$1 name
-    name=$(svc_field "$id" container)
+    local id=$1 name claim
+    claim=$(svc_claimfile "$id")
+    if [[ -r $claim ]]; then
+        name=$(claim_field "$claim" container)
+    fi
+    [[ -n $name ]] || name=$(svc_field "$id" container)
     [[ -n $name ]] || return 0
     docker_quiet ps -a --filter "name=^/${name}\$" --format '{{.Status}}' 2>/dev/null | head -1 || true
 }
@@ -575,7 +853,7 @@ wait_for_port() {
     port_open "$port" && { ok "$label ya escuchaba en :$port"; return 0; }
     log "Esperando $label en :$port (hasta ${timeout}s)..."
     while ((i < timeout)); do
-        if port_open "$port"; then
+        if port_open_fresh "$port"; then
             ok "$label escuchando en :$port"
             return 0
         fi
@@ -602,7 +880,7 @@ wait_for_http() {
 wait_port_closed() {
     local port=$1 i=0
     while ((i < 15)); do
-        port_open "$port" || return 0
+        port_open_fresh "$port" || return 0
         sleep 0.5
         i=$((i + 1))
     done
@@ -641,15 +919,22 @@ start_process() {
         [[ -n $hint ]] && warn "$hint"
         die "$label no arrancó${hint:+ — $hint}"
     }
+    write_claim "$id" "$port" "$(<"$pidfile")" "" ""
     log "$label iniciado (pid $(<"$pidfile")) → $logfile"
 }
 
 stop_process() {
-    local id=$1 label=$2 port=$3 pid i=0
+    local id=$1 label=$2 port=$3 pid i=0 owner
     if ! pid=$(pid_of_file "$(svc_pidfile "$id")"); then
         rm -f "$(svc_pidfile "$id")"
+        clear_claim "$id"
         if [[ -n $port ]] && port_open "$port"; then
-            warn "$label escucha en :$port pero lo levantó otra cosa (una terminal tuya); no lo toco"
+            owner=$(port_owner_project "$port") || true
+            if [[ -n $owner && $owner != "$CURRENT" ]]; then
+                warn "$label: :$port lo tiene $owner; no lo toco"
+            else
+                warn "$label escucha en :$port pero lo levantó otra cosa (una terminal tuya); no lo toco"
+            fi
         else
             log "$label ya estaba detenido"
         fi
@@ -665,6 +950,7 @@ stop_process() {
         kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
     fi
     rm -f "$(svc_pidfile "$id")"
+    clear_claim "$id"
     [[ -n $port ]] && { wait_port_closed "$port" || warn "$label sigue escuchando en :$port"; }
     ok "$label detenido"
 }
@@ -675,9 +961,17 @@ managed_process() { pid_of_file "$(svc_pidfile "$1")" >/dev/null; }
 # ANTES de matar: después ps ya no lo encuentra y con set -e eso terminaba el
 # script en silencio.
 force_free_port() {
-    local port=$1 label=$2 pid pgid own_pgid can_group=1 i=0
+    local port=$1 label=$2 pid pgid own_pgid can_group=1 i=0 owner
     [[ -n $port ]] || return 0
-    port_open "$port" || return 0
+    port_open_fresh "$port" || return 0
+    # --force es para procesos sueltos, no para el stack de otro proyecto: eso
+    # es exactamente el cruce que estamos sacando. A ese lo mueve `up` cuando
+    # le toque arrancar (o el botón de mover puerto).
+    owner=$(port_owner_project "$port") || true
+    if [[ -n $owner && $owner != "$CURRENT" ]]; then
+        warn "$label: :$port lo tiene el proyecto '$owner'; no lo toco (movés el tuyo con 'devstack $CURRENT port --auto')"
+        return 1
+    fi
     pid=$(port_owner "$port")
     if [[ -z $pid ]]; then
         warn "$label: :$port está ocupado por otro usuario; no puedo liberarlo"
@@ -689,28 +983,28 @@ force_free_port() {
 
     log "Matando el $label ajeno (pid $pid) que tiene :$port..."
     kill -TERM "$pid" 2>/dev/null || true
-    while ((i < 10)) && port_open "$port"; do
+    while ((i < 10)) && port_open_fresh "$port"; do
         sleep 0.5
         i=$((i + 1))
     done
 
-    if port_open "$port" && ((can_group)); then
+    if port_open_fresh "$port" && ((can_group)); then
         log "Sigue ocupado: mando TERM al grupo $pgid"
         kill -TERM "-$pgid" 2>/dev/null || true
         i=0
-        while ((i < 6)) && port_open "$port"; do
+        while ((i < 6)) && port_open_fresh "$port"; do
             sleep 0.5
             i=$((i + 1))
         done
     fi
 
-    if port_open "$port"; then
+    if port_open_fresh "$port"; then
         kill -KILL "$pid" 2>/dev/null || true
         ((can_group)) && kill -KILL "-$pgid" 2>/dev/null || true
         sleep 0.5
     fi
 
-    if port_open "$port"; then
+    if port_open_fresh "$port"; then
         warn "$label: :$port sigue ocupado"
         return 1
     fi
@@ -720,12 +1014,18 @@ force_free_port() {
 # ---------------------------------------------------------------- servicios
 
 svc_up() {
-    local id=$1 label port type
+    local id=$1 label port type owner=""
     label=$(svc_label "$id")
-    port=$(svc_port "$id")
     type=$(svc_type "$id")
+    # El puerto pudo haberse movido (otro proyecto ya lo tenía): se relee.
+    maybe_reassign_port "$id"
+    port=$(svc_port "$id")
 
-    if [[ -n $port ]] && port_open "$port"; then
+    if [[ -n $port ]] && port_open_fresh "$port"; then
+        owner=$(port_owner_project "$port") || true
+        if [[ -n $owner && $owner != "$CURRENT" ]]; then
+            die "$label: :$port lo tiene el proyecto '$owner' (no lo pude mover solo; usá 'devstack $CURRENT port --auto')"
+        fi
         if [[ $type == docker ]]; then
             local st
             st=$(container_status "$id")
@@ -733,7 +1033,7 @@ svc_up() {
         elif managed_process "$id"; then
             ok "$label ya corriendo (lo levantó este script)"
         else
-            ok "$label ya escucha en :$port (ajeno${owner:+, pid $(port_owner "$port")}); no lo toco"
+            ok "$label ya escucha en :$port (lo levantaste a mano${owner:+ en $owner}); no lo toco"
         fi
         return 0
     fi
@@ -749,11 +1049,21 @@ svc_up() {
         return 0
     fi
 
-    local dir wait cmd
+    local dir wait cmd create
     dir=$(svc_dir "$id")
     wait=$(svc_field "$id" wait)
     cmd=$(svc_field "$id" cmd)
     [[ -n $cmd ]] || die "El servicio '$id' necesita 'cmd'"
+    # `create` es para servicios que traen su propio directorio de trabajo
+    # (el demo). Se crea 0700 y se rechaza un symlink: una ruta predecible que
+    # otro usuario local pueda preparar no se usa como cwd.
+    create=$(svc_field "$id" create)
+    if [[ $create == true ]]; then
+        [[ -L $dir ]] && die "El directorio de $label es un symlink: $dir"
+        mkdir -p -m 700 "$dir" || die "No pude crear el directorio de $label: $dir"
+        [[ -O $dir ]] || die "$dir no es mío; no escribo ahí"
+        chmod 700 "$dir" 2>/dev/null || true
+    fi
     [[ -d $dir ]] || die "No existe el directorio de $label: $dir"
     log "Iniciando $label ($cmd)..."
     notify "Compilando $label…"
@@ -783,20 +1093,20 @@ svc_up() {
 }
 
 compose_logs() {
-    local id=$1 file
-    file=$(svc_field "$id" compose)
-    [[ $file == /* ]] || file="$DIR/$file"
+    local id=$1 project
+    project=$(compose_project_name)
+    [[ -r $(compose_generated_file "$id") ]] || ensure_compose_file "$id"
     resolve_docker
-    ( cd "$DIR" && "${DOCKER[@]}" compose -f "$file" logs )
+    ( cd "$DIR" && "${DOCKER[@]}" compose -p "$project" -f "$(compose_generated_file "$id")" logs )
 }
 
 svc_down() {
-    local id=$1 label port type
+    local id=$1 force=${2:-} label port type
     label=$(svc_label "$id")
     port=$(svc_port "$id")
     type=$(svc_type "$id")
     if [[ $type == docker ]]; then
-        compose_down "$id" || die "docker compose down falló para $label"
+        compose_down "$id" "$force" || die "docker compose down falló para $label"
         ok "$label detenido"
     else
         stop_process "$id" "$label" "$port"
@@ -846,7 +1156,7 @@ down() {
     local i
     for ((i = ${#ids[@]} - 1; i >= 0; i--)); do
         [[ -n $keep && $(svc_type "${ids[i]}") == docker ]] && continue
-        svc_down "${ids[i]}"
+        svc_down "${ids[i]}" "${force:+force}"
     done
     ok "Listo"
     notify_result "Stack detenido"
@@ -872,7 +1182,7 @@ restart() {
     fi
     local id
     for id in "${targets[@]}"; do
-        svc_down "$id"
+        svc_down "$id" "${force:+force}"
         svc_up "$id"
     done
     elapsed=$(( $(date +%s) - started ))
@@ -891,7 +1201,7 @@ report_ready() {
         if [[ -n $health ]]; then
             http_ok "$health" 5 || bad="$bad $(svc_label "$id")"
         elif [[ -n $port ]]; then
-            port_open "$port" || bad="$bad $(svc_label "$id")"
+            port_open_fresh "$port" || bad="$bad $(svc_label "$id")"
         fi
     done
     if [[ -n $bad ]]; then
@@ -955,14 +1265,38 @@ print_urls() {
     done
 }
 
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/ }
+    printf '%s' "$s"
+}
+
 svc_state() {
-    local id=$1 port health up healthy managed
+    local id=$1 port health up healthy managed owner conflict=false claim
     port=$(svc_port "$id")
     health=$(svc_field "$id" health)
     if [[ -n $port ]] && port_open "$port"; then up=true; else up=false; fi
-    if [[ -n $health ]] && http_ok "$health" 5; then healthy=true; else healthy=false; fi
-    if managed_process "$id"; then managed=true; else managed=false; fi
-    printf '%s' "{\"id\":\"$(svc_field "$id" id)\",\"label\":\"$(svc_label "$id")\",\"type\":\"$(svc_type "$id")\",\"port\":${port:-0},\"up\":$up,\"healthy\":$healthy,\"managed\":$managed,\"health\":\"$health\",\"url\":\"$(svc_url "$id")\"}"
+    owner=""
+    managed=false
+    if [[ $up == true ]]; then
+        owner=$(port_owner_project "$port") || true
+        # El puerto puede estar abierto porque otro proyecto lo tenía primero.
+        # Eso no es "mi stack arriba": se muestra el dueño y no cuenta.
+        if [[ -n $owner && $owner != "$CURRENT" ]]; then
+            conflict=true
+            up=false
+        fi
+    fi
+    claim=$(svc_claimfile "$id")
+    if [[ -r $claim ]] && [[ $(claim_field "$claim" project) == "$CURRENT" ]]; then
+        managed=true
+    elif managed_process "$id"; then
+        managed=true
+    fi
+    if [[ $up == true && -n $health ]] && http_ok "$health" 1; then healthy=true; else healthy=false; fi
+    printf '%s' "{\"id\":\"$(json_escape "$(svc_field "$id" id)")\",\"label\":\"$(json_escape "$(svc_label "$id")")\",\"type\":\"$(svc_type "$id")\",\"port\":${port:-0},\"up\":$up,\"healthy\":$healthy,\"managed\":$managed,\"owner\":\"$(json_escape "$owner")\",\"conflict\":$conflict,\"health\":\"$(json_escape "$health")\",\"url\":\"$(json_escape "$(svc_url "$id")")\"}"
 }
 
 json_status() {
@@ -976,8 +1310,9 @@ json_status() {
     if [[ -r $RUNTIME_DIR/result.json ]] && jq -e . "$RUNTIME_DIR/result.json" >/dev/null 2>&1; then
         last=$(cat "$RUNTIME_DIR/result.json")
     fi
-    printf '{"project":"%s","name":"%s","dir":"%s","services":[%s],"open":"%s","lang":"%s","lastResult":%s}\n' \
-        "$CURRENT" "$DEVDATA_NAME" "$DIR" "$out" "$(open_service)" "$(lang_cmd)" "$last"
+    printf '{"project":"%s","name":"%s","dir":"%s","services":[%s],"open":"%s","lang":"%s","pinned":"%s","lastResult":%s}\n' \
+        "$(json_escape "$CURRENT")" "$(json_escape "$DEVDATA_NAME")" "$(json_escape "$DIR")" "$out" "$(open_service)" \
+        "$(lang_cmd)" "$(pinned_project)" "$last"
 }
 
 status() {
@@ -997,16 +1332,26 @@ status() {
         else
             st="escuchando"
         fi
+        owner=$(port_owner_project "$port") || true
         if [[ $type == docker ]]; then
             # El contenedor puede ser ajeno (ya estaba arriba): sin nombre no se
             # muestra el paréntesis, que quedaba como "(contenedor: )".
             cname=$(container_status "$id")
             [[ -n $cname ]] && st="$st (contenedor: $cname)"
+        elif [[ -n $owner && $owner != "$CURRENT" ]]; then
+            st="$st (lo tiene el proyecto $owner)"
         elif managed_process "$id"; then
             st="$st (gestionado, pid $(<"$(svc_pidfile "$id")"))"
+        elif [[ -n $owner ]]; then
+            st="$st (a mano en $owner)"
         else
-            owner=$(port_owner "$port")
-            st="$st (ajeno${owner:+, pid $owner})"
+            local pid
+            pid=$(port_owner "$port")
+            st="$st (ajeno${pid:+, pid $pid})"
+        fi
+        local declared
+        if declared=$(declared_project_for_port "$port"); then
+            st="$st · :$port también lo declara $declared"
         fi
         printf '  %-12s %-6s %s\n' "$label" ":$port" "$st"
     done
@@ -1268,13 +1613,20 @@ list_user_projects() {
 # Primer puerto libre desde uno dado: ni declarado por otro proyecto, ni ocupado.
 pick_free_port() {
     local from=${1:-3000} p other f taken
-    for ((p = from + 1; p <= from + 60; p++)); do
+    # Primero cerca del puerto actual; si el rango se acaba (p. ej. :65000), se
+    # vuelve a buscar desde 3000. Así "mover el puerto" nunca se queda sin
+    # opciones por estar en el borde.
+    local candidates=()
+    for ((p = from + 1; p <= from + 60; p++)); do candidates+=("$p"); done
+    for ((p = 3000; p < 3060; p++)); do candidates+=("$p"); done
+    for p in "${candidates[@]}"; do
         ((p >= 1024 && p <= 65000)) || continue
         port_open "$p" && continue
         # Ni otro servicio del MISMO proyecto (elegir el puerto del backend para
         # el frontend fue un bug real), ni lo que declare otro proyecto.
         taken=$(jq -r --argjson p "$p" '[.services[]? | select(.port == $p)] | length' "$CONFIG_FILE" 2>/dev/null)
         [[ ${taken:-0} != 0 ]] && continue
+        [[ -n $(claim_project_for_port "$p") ]] && continue
         other=""
         for f in $(list_user_projects); do
             [[ $f == "$CURRENT" ]] && continue
@@ -1289,6 +1641,119 @@ pick_free_port() {
         return 0
     done
     return 1
+}
+
+# Escribe el puerto nuevo en el config: port, url, health y el cmd. Para docker
+# el puerto del host lo publica el compose aislado que genera `compose_up`; acá
+# sólo se actualiza lo que ve devstack.
+port_apply() { # id viejo nuevo [dry]
+    local id=$1 old=$2 new=$3 dry=${4:-} type cmd cmd_new note="" url_new health_new tmp
+    type=$(svc_type "$id")
+    if [[ $type == docker ]]; then
+        cmd_new=""
+    else
+        # El cmd: {port} si ya lo tiene, el flag por npm si es un `npm run …`, o
+        # el puerto literal si estaba escrito.
+        cmd=$(svc_field "$id" cmd)
+        cmd_new=$cmd
+        if [[ $cmd == *"{port}"* ]]; then
+            note="cmd ya usa {port}"
+        elif [[ $cmd =~ (^|[^0-9])$old([^0-9]|$) ]]; then
+            # El puerto escrito a mano (`python3 -m http.server 4810`, o
+            # `--port 4810`) también se reemplaza: si no, mover el puerto dejaba
+            # el servicio escuchando en el viejo.
+            cmd_new=$(printf '%s' "$cmd" | sed -E "s/(^|[^0-9])$old([^0-9]|$)/\\1{port}\\2/g")
+            note="cmd ahora usa {port}"
+        elif [[ $cmd == *" -- "* || $cmd == *" --port "* ]]; then
+            note="cmd ya pasa un puerto fijo: revisalo"
+        elif [[ $cmd =~ ^(npm|pnpm|yarn|bun|bunx)[[:space:]]+(run[[:space:]]+)?[^[:space:]]+[[:space:]]*$ ]]; then
+            cmd_new="$cmd -- --port {port}"
+        else
+            note="aviso: el cmd no declara el puerto; devstack le exporta PORT"
+        fi
+    fi
+
+    url_new=$(svc_field "$id" url)
+    health_new=$(svc_field "$id" health)
+    [[ -n $url_new ]] && url_new=${url_new//:$old/:$new}
+    [[ -n $health_new ]] && health_new=${health_new//:$old/:$new}
+
+    if [[ -n $dry ]]; then
+        printf '  %-10s :%s → :%s\n' "$id" "$old" "$new"
+        [[ $type != docker ]] && printf '  %-10s %s\n' cmd "${cmd_new:-$cmd}"
+        [[ -n $note ]] && printf '  %-10s %s\n' nota "$note"
+        return 0
+    fi
+
+    tmp=$(mktemp)
+    jq --arg id "$id" --argjson port "$new" --arg cmd "$cmd_new" \
+        --arg url "$url_new" --arg health "$health_new" '
+        (.services[] | select(.id == $id)) |= (
+            .port = $port
+            | (if ($url | length) > 0 then .url = $url else . end)
+            | (if ($health | length) > 0 then .health = $health else . end)
+            | (if ($cmd | length) > 0 then .cmd = $cmd else . end)
+        )' "$CONFIG_FILE" >"$tmp" || {
+        rm -f "$tmp"
+        die "No pude reescribir $CONFIG_FILE"
+    }
+    cat "$tmp" >"$CONFIG_FILE"
+    rm -f "$tmp"
+    [[ -n $note ]] && log "$note" || true
+    return 0
+}
+
+# Devstack mueve el puerto de ESTE proyecto cuando el declarado ya es de otro.
+# Nunca mata ni reconfigura el stack ajeno: el otro se queda donde está.
+move_service_port() { # id [motivo]
+    local id=$1 why=${2:-} old new
+    old=$(svc_port "$id")
+    [[ -n $old && $old != 0 ]] || return 1
+    new=$(pick_free_port "$old") || die "No encontré un puerto libre cerca de :$old para $(svc_label "$id")"
+    port_apply "$id" "$old" "$new"
+    ok "$(svc_label "$id"): :$old → :$new${why:+ ($why)}"
+    log "El cambio queda en $CONFIG_FILE"
+}
+
+# Antes de levantar un servicio: si su puerto lo tiene otro proyecto (claim,
+# cwd del proceso o declaración), se mueve el NUESTRO. Si el puerto lo tiene un
+# proceso suelto sin dueño identificable, se deja: puede ser tu instancia a mano.
+maybe_reassign_port() { # id
+    local id=$1 port type owner declared
+    port=$(svc_port "$id")
+    [[ -n $port && $port != 0 ]] || return 0
+    type=$(svc_type "$id")
+    # Un servicio nuestro ya arriba no se mueve bajo los pies.
+    if [[ $type != docker ]] && managed_process "$id" && port_open "$port"; then
+        return 0
+    fi
+    if port_open "$port"; then
+        owner=$(port_owner_project "$port") || true
+        # Si el que escucha es de este proyecto (lo levantaste a mano en la
+        # terminal), no se toca: `up` lo da por arriba.
+        if [[ -n $owner && $owner == "$CURRENT" ]]; then
+            return 0
+        fi
+        if [[ -n $owner && $owner != "$CURRENT" ]]; then
+            move_service_port "$id" "lo tenía $owner"
+            return 0
+        fi
+        # No se pudo resolver el dueño (proceso de root, docker-proxy), pero
+        # otro proyecto declara ese puerto: el nuestro se mueve igual.
+        if declared=$(declared_project_for_port "$port"); then
+            move_service_port "$id" ":$port lo declara $declared"
+            return 0
+        fi
+        # Docker ajeno (legacy o de otro proyecto sin claim): se mueve el nuestro.
+        if [[ $type == docker ]]; then
+            move_service_port "$id" ":$port ya está ocupado"
+            return 0
+        fi
+    fi
+    # Si el puerto está libre y otro proyecto lo declara, lo deja: el que
+    # arranque segundo es el que se mueve. Mover los dos por las dudas rompía
+    # configs que nunca chocaban.
+    return 0
 }
 
 # Puerto de un servicio: devstack <p> port [<servicio>] [--to N|--auto] [--dry-run] [--force]
@@ -1326,7 +1791,7 @@ port_cmd() {
     fi
     svc_index "$id" >/dev/null || die "No existe el servicio '$id' en $CURRENT"
 
-    local type old new cmd
+    local type old new
     type=$(svc_type "$id")
     [[ $type == docker ]] && die "El puerto de '$id' lo define su compose: cambialo ahí (devstack sólo lo chequea)"
     old=$(svc_port "$id")
@@ -1355,53 +1820,13 @@ port_cmd() {
     fi
     ((new != old)) || die "Ya usa :$new"
 
-    # El cmd: {port} si ya lo tiene, el flag por npm si es un `npm run …`, o el
-    # puerto literal si estaba escrito.
-    cmd=$(svc_field "$id" cmd)
-    local cmd_new=$cmd note=""
-    if [[ $cmd == *"{port}"* ]]; then
-        note="cmd ya usa {port}"
-    elif [[ $cmd == *" -- "* || $cmd == *" --port "* ]]; then
-        note="cmd ya pasa un puerto: revisalo"
-    elif [[ $cmd =~ ^(npm|pnpm|yarn|bun|bunx)[[:space:]]+(run[[:space:]]+)?[^[:space:]]+[[:space:]]*$ ]]; then
-        cmd_new="$cmd -- --port {port}"
-    elif [[ $cmd == *":$old"* ]]; then
-        local ph='{port}'
-        cmd_new=${cmd//:$old/:$ph}
-    else
-        note="aviso: el cmd no declara el puerto; devstack le exporta PORT"
-    fi
-
-    local url_new health_new
-    url_new=$(svc_field "$id" url)
-    health_new=$(svc_field "$id" health)
-    [[ -n $url_new ]] && url_new=${url_new//:$old/:$new}
-    [[ -n $health_new ]] && health_new=${health_new//:$old/:$new}
-
-    if [[ -n $dry ]] && [[ ${DEVDATA_DRY_QUIET:-} != 1 ]]; then
-        printf '  %-10s :%s → :%s\n' "$id" "$old" "$new"
-        printf '  %-10s %s\n' cmd "${cmd_new:-$cmd}"
-        [[ -n $note ]] && printf '  %-10s %s\n' nota "$note"
+    if [[ -n $dry ]]; then
+        [[ ${DEVDATA_DRY_QUIET:-} == 1 ]] && return 0
+        port_apply "$id" "$old" "$new" dry
         return 0
     fi
-
-    local tmp
-    tmp=$(mktemp)
-    jq --arg id "$id" --argjson port "$new" --arg cmd "$cmd_new" \
-        --arg url "$url_new" --arg health "$health_new" '
-        (.services[] | select(.id == $id)) |= (
-            .port = $port
-            | (if ($url | length) > 0 then .url = $url else . end)
-            | (if ($health | length) > 0 then .health = $health else . end)
-            | (if ($cmd | length) > 0 then .cmd = $cmd else . end)
-        )' "$CONFIG_FILE" >"$tmp" || {
-        rm -f "$tmp"
-        die "No pude reescribir $CONFIG_FILE"
-    }
-    cat "$tmp" >"$CONFIG_FILE"
-    rm -f "$tmp"
+    port_apply "$id" "$old" "$new"
     ok "$id: :$old → :$new"
-    [[ -n $note ]] && log "$note"
     log "Se aplica al reiniciar: devstack $CURRENT restart $id"
 }
 
@@ -1435,24 +1860,83 @@ project_snapshot() {
         up: ([.services[] | select(.up)] | length),
         total: (.services | length),
         allUp: (([.services[] | select(if .health != "" then .healthy else .up end)] | length) == (.services | length)),
-        services: [.services[] | {id: .id, label: .label, type: .type, port: .port, up: .up, healthy: .healthy, managed: .managed}],
+        services: [.services[] | {id: .id, label: .label, type: .type, port: .port, up: .up, healthy: .healthy, managed: .managed, owner: .owner, conflict: .conflict}],
+        conflicts: ([.services[] | select(.conflict)] | length),
         lastResult: $last}' --argjson last "$last"
 }
 
-# devstack all [json|status|up|down]
+# Para `all down`: los proyectos que ya no tenés declarados también son de
+# devstack y sus pidfiles quedaban vivos (el "medio levantado" que no bajaba
+# nadie porque ya no había config que lo nombrara).
+stop_orphan_runtimes() {
+    local dir p pf pid i any=0
+    for dir in "$RUNTIME_BASE"/*/; do
+        [[ -d $dir ]] || continue
+        p=$(basename "$dir")
+        [[ $p == all ]] && continue
+        project_file "$p" >/dev/null 2>&1 && continue
+        for pf in "$dir"/*.pid; do
+            [[ -r $pf ]] || continue
+            any=1
+            pid=$(pid_of_file "$pf") || { rm -f "$pf"; continue; }
+            log "Bajando resto huérfano de $p (pid $pid)"
+            kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+            i=0
+            while ((i < 10)) && kill -0 "$pid" 2>/dev/null; do sleep 0.5; i=$((i + 1)); done
+            kill -0 "$pid" 2>/dev/null && { kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; }
+            rm -f "$pf"
+        done
+        # Un compose aislado de un proyecto que ya no existe también es nuestro.
+        for gen in "$dir"/*.compose.json; do
+            [[ -r $gen ]] || continue
+            any=1
+            command -v docker >/dev/null 2>&1 && docker compose -f "$gen" down >/dev/null 2>&1 || true
+            rm -f "$gen" "$dir"/*.compose-service 2>/dev/null || true
+        done
+        rm -f "$dir"/*.claim 2>/dev/null || true
+    done
+    ((any)) && ok "Restos huérfanos detenidos"
+    return 0
+}
+
+# devstack all [json|status|up|down [--force]]
 all_cmd() {
-    local sub=${1:-status} p s
+    local sub=${1:-status} force="" p s
+    shift || true
+    for s in "$@"; do [[ $s == --force ]] && force=1; done
     local projects=() snaps=()
     while IFS= read -r p; do [[ -n $p ]] && projects+=("$p"); done < <(list_user_projects)
     if [[ ${#projects[@]} -eq 0 ]]; then
+        if [[ $sub == down ]]; then
+            stop_orphan_runtimes
+            notify_result "No hay proyectos declarados; restos huérfanos detenidos"
+            return 0
+        fi
         die "No hay proyectos declarados (devstack add <dir> o devstack init <nombre>)"
     fi
     case $sub in
         json)
+            # En paralelo: antes cada proyecto era un hijo secuencial y con un
+            # health que no contestaba la barra esperaba la suma de todos.
+            local tmpdir
+            tmpdir=$(mktemp -d)
             for p in "${projects[@]}"; do
-                s=$(project_snapshot "$p") || continue
-                snaps+=("$s")
+                ( "$0" "$p" json >"$tmpdir/$p.json" 2>/dev/null ) &
             done
+            wait || true
+            for p in "${projects[@]}"; do
+                if [[ -s $tmpdir/$p.json ]] && jq -e . "$tmpdir/$p.json" >/dev/null 2>&1; then
+                    s=$(jq -c '{project: .project, name: .name, dir: .dir,
+                        up: ([.services[] | select(.up)] | length),
+                        total: (.services | length),
+                        allUp: (([.services[] | select(if .health != "" then .healthy else .up end)] | length) == (.services | length)),
+                        services: [.services[] | {id: .id, label: .label, type: .type, port: .port, up: .up, healthy: .healthy, managed: .managed, owner: .owner, conflict: .conflict}],
+                        conflicts: ([.services[] | select(.conflict)] | length),
+                        lastResult: .lastResult}' "$tmpdir/$p.json")
+                    snaps+=("$s")
+                fi
+            done
+            rm -rf "$tmpdir"
             printf '[%s]\n' "$(printf '%s\n' "${snaps[@]:-}" | grep -v '^$' | paste -sd, -)"
             ;;
         status)
@@ -1462,7 +1946,7 @@ all_cmd() {
                 printf '%-14s %-18s %-7s %s\n' "$p" \
                     "$(printf '%s' "$s" | jq -r .name)" \
                     "$(printf '%s' "$s" | jq -r '"\(.up)/\(.total)"')" \
-                    "$(printf '%s' "$s" | jq -r '[.services[] | (if .healthy then "✓" elif .up then "~" else "·" end)] | join("")')"
+                    "$(printf '%s' "$s" | jq -r '[.services[] | (if .conflict then "!" elif .healthy then "✓" elif .up then "~" else "·" end)] | join("")')"
             done
             # Puertos compartidos: el "arriba" de un proyecto puede ser el
             # proceso del otro (dos proyectos en :3000 se contestan cruzado).
@@ -1480,13 +1964,19 @@ all_cmd() {
             notify_result "Todos los stacks arriba"
             ;;
         down)
-            local i
+            local i failed=0
             for ((i = ${#projects[@]} - 1; i >= 0; i--)); do
-                "$0" "${projects[$i]}" down
+                "$0" "${projects[$i]}" down ${force:+--force} || failed=1
             done
+            stop_orphan_runtimes
+            if ((failed)); then
+                warn "Algún proyecto no terminó de bajar; mirá 'devstack all status'"
+                notify_result "Apagado parcial: algún stack sigue arriba"
+                return 1
+            fi
             notify_result "Todos los stacks detenidos"
             ;;
-        *) die "all: usá json|status|up|down" ;;
+        *) die "all: usá json|status|up|down [--force]" ;;
     esac
 }
 
@@ -1649,13 +2139,129 @@ menu_block() {
     ' "$CONFIG_FILE" | jq -r 'to_entries[] | "  \"\(.key)\": \(.value | tojson),"'
 }
 
+menu_jsonc_path() {
+    printf '%s/omarchy/extensions/omarchy-menu.jsonc' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+# El botón Menú del widget apuntaba a dev.<proyecto>. Si esa ruta no existía,
+# `omarchy menu summon` abría el menú RAÍZ de Omarchy (el bug de "se abre el
+# menú de Omarchy"). Ahora se verifica y, si falta, se instala el bloque.
+menu_route_present() {
+    local project=$1 file
+    file=$(menu_jsonc_path)
+    [[ -r $file ]] || return 1
+    grep -Fq "\"dev.$project\"" "$file"
+}
+
+menu_install() {
+    local file tmp block check out p f backup count=0
+    file=$(menu_jsonc_path)
+    mkdir -p "$(dirname "$file")"
+    [[ -f $file ]] || printf '{\n}\n' >"$file"
+    block=$(mktemp)
+    {
+        printf '  // >>> devstack (generado por devstack menu --install)\n'
+        for p in $(list_user_projects); do
+            if out=$( ( load_project "$p"; menu_block dev ) 2>/dev/null ); then
+                printf '%s\n' "$out"
+                count=$((count + 1))
+            else
+                warn "No pude generar el menú de '$p'; lo salto" >&2
+            fi
+        done
+        printf '  // <<< devstack\n'
+    } >"$block"
+    ((count > 0)) || { rm -f "$block"; die "No hay proyectos para el menú (devstack add <dir> o devstack init <nombre>)"; }
+
+    tmp=$(mktemp)
+    awk -v blockfile="$block" '
+      BEGIN { block = ""; while ((getline line < blockfile) > 0) block = block line "\n" }
+      /^[[:space:]]*\/\/ >>> devstack/ { skip = 1; next }
+      /^[[:space:]]*\/\/ <<< devstack/ { skip = 0; next }
+      skip { next }
+      { n++; out[n] = $0 }
+      END {
+        last = 0
+        for (i = n; i >= 1; i--) { t = out[i]; gsub(/[[:space:]]/, "", t); if (t == "}") { last = i; break } }
+        for (i = 1; i <= n; i++) {
+          if (i == last) printf "%s", block
+          print out[i]
+        }
+      }
+    ' "$file" >"$tmp"
+
+    check=""
+    for f in "$SCRIPT_DIR/../scripts/jsonc-check.py" "$SCRIPT_DIR/scripts/jsonc-check.py"; do
+        [[ -r $f ]] && { check=$f; break; }
+    done
+    if command -v python3 >/dev/null 2>&1 && [[ -n $check ]]; then
+        if ! python3 "$check" "$tmp" >/dev/null 2>&1; then
+            rm -f "$tmp" "$block"
+            die "El menú resultante no parsea; no toqué $file"
+        fi
+    fi
+    backup="$file.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$file" "$backup" 2>/dev/null || true
+    cat "$tmp" >"$file"
+    rm -f "$tmp" "$block"
+    ok "Menú de Omarchy actualizado (backup: $backup)"
+    command -v omarchy >/dev/null 2>&1 && omarchy menu refresh >/dev/null 2>&1 || true
+}
+
+menu_remove() {
+    local file tmp
+    file=$(menu_jsonc_path)
+    [[ -r $file ]] || return 0
+    tmp=$(mktemp)
+    awk '
+      /^[[:space:]]*\/\/ >>> devstack/ { skip = 1; next }
+      /^[[:space:]]*\/\/ <<< devstack/ { skip = 0; next }
+      !skip { print }
+    ' "$file" >"$tmp"
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
+    ok "Sección devstack quitada del menú de Omarchy"
+    command -v omarchy >/dev/null 2>&1 && omarchy menu refresh >/dev/null 2>&1 || true
+}
+
+menu_cmd() {
+    local sub=${1:-} project=${2:-}
+    case $sub in
+        --help | -h)
+            printf 'devstack menu --install            instala/actualiza el bloque de todos tus proyectos\n'
+            printf 'devstack menu --ensure <proyecto>  lo instala sólo si falta dev.<proyecto>\n'
+            printf 'devstack menu --remove             quita el bloque devstack\n'
+            printf 'devstack <proyecto> menu           imprime el bloque JSONC de ese proyecto\n'
+            ;;
+        --install)
+            menu_install
+            ;;
+        --ensure)
+            [[ -n $project ]] || die "menu --ensure necesita el proyecto"
+            project_file "$project" >/dev/null || die "No existe el proyecto '$project'"
+            menu_route_present "$project" && return 0
+            menu_install
+            menu_route_present "$project" || die "Instalé el menú pero no encuentro la ruta dev.$project"
+            ;;
+        --remove)
+            menu_remove
+            ;;
+        "")
+            usage
+            ;;
+        *)
+            die "menu: usá --install, --ensure <proyecto> o --remove"
+            ;;
+    esac
+}
+
 usage() {
     sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------- dispatch
 
-KNOWN_COMMANDS=" up down restart status json logs open task list menu init use find port lang --running --up --foreign "
+KNOWN_COMMANDS=" up down restart status json logs open task list menu init use find port lang pin compose-file --running --up --foreign "
 
 [[ $# -gt 0 ]] || {
     list_projects
@@ -1689,6 +2295,20 @@ case "$1" in
     use)
         use_cmd "${2:-}"
         exit 0
+        ;;
+    pin)
+        pin_cmd "${2:-}"
+        exit 0
+        ;;
+    menu)
+        # Opciones del menú (instalar/verificar/quitar). Sin opciones sigue
+        # imprimiendo el bloque del proyecto, como siempre.
+        case ${2:-} in
+            --install | --ensure | --remove | --help | -h)
+                menu_cmd "${@:2}"
+                exit 0
+                ;;
+        esac
         ;;
     lang)
         lang_cmd "${2:-}"
@@ -1735,6 +2355,13 @@ case "$CMD" in
     list) list_all ;;
     menu) menu_block "${1:-dev}" ;;
     port) port_cmd "$@" ;;
+    compose-file)
+        # Compose aislado que usa `up` (para depurar el mapeo de puertos).
+        [[ -n ${1:-} ]] || die "compose-file: falta el servicio docker"
+        ensure_runtime
+        ensure_compose_file "$1"
+        cat "$(compose_generated_file "$1")"
+        ;;
     --running)
         rc=0
         for id in $(svc_ids); do
@@ -1756,7 +2383,13 @@ case "$CMD" in
         for id in $(svc_ids); do
             p=$(svc_port "$id")
             [[ -n $p ]] || continue
-            if port_open "$p" && ! managed_process "$id" && [[ $(svc_type "$id") != docker ]]; then rc=0; fi
+            [[ $(svc_type "$id") == docker ]] && continue
+            port_open "$p" || continue
+            managed_process "$id" && continue
+            owner=$(port_owner_project "$p") || true
+            # El de otro proyecto no se "toma": `up` mueve el nuestro.
+            [[ -n $owner && $owner != "$CURRENT" ]] && continue
+            rc=0
         done
         exit $rc
         ;;

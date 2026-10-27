@@ -65,6 +65,9 @@ jobs:
       - name: MCP server
         run: ./test/mcp_test.sh
 
+      - name: Port ownership and project isolation
+        run: ./test/ownership_test.sh
+
       - name: Home project (`devstack use`)
         run: ./test/use_test.sh
 
@@ -94,6 +97,9 @@ jobs:
           if bin/devstack demo --up; then
             echo "the port should be closed after down"; exit 1
           fi
+
+      - name: Demo runs isolated in a private directory
+        run: ./test/demo_safety_test.sh
 
       - name: Bare command without a project uses the default
         run: |

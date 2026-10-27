@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "meperdonas.devstack",
   "name": "devstack",
-  "version": "1.10.4",
+  "version": "1.12.0",
   "author": "Santiago Villabona (meperdev)",
   "license": "MIT",
-  "description": "Local dev stacks in the Omarchy bar: one icon per project or an aggregate of all of them, per-service state, lift/drop/open/logs/restart, a finder for the repos you have not declared yet, ports you can move with one click, and an MCP server so your coding agents can drive the stacks themselves.",
+  "description": "Local dev stacks in the Omarchy bar: one icon per project or an aggregate of all of them, per-service state and ownership, lift/drop/open/logs/restart, automatic port moves so two projects never cross, isolated docker compose per project, a stop-everything panic button, a finder for repos you have not declared yet, and an MCP server so your coding agents can drive the stacks themselves.",
   "kinds": [
     "bar-widget"
   ],

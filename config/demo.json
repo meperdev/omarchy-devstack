@@ -1,12 +1,13 @@
 {
   "name": "devstack demo",
-  "dir": "/tmp",
+  "dir": "~",
   "services": [
     {
       "id": "web",
       "label": "static",
-      "dir": "/tmp",
-      "cmd": "python3 -m http.server 8080 --bind 127.0.0.1",
+      "dir": ".local/state/devstack/demo",
+      "create": true,
+      "cmd": "python3 -I -m http.server 8080 --bind 127.0.0.1",
       "port": 8080,
       "url": "http://localhost:8080",
       "health": "http://localhost:8080",
