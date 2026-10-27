@@ -92,7 +92,8 @@ runtime_base() {
     fi
     # Ojo: esto corre antes de que exista `die`, así que los errores se imprimen
     # acá mismo (y se corta con exit 1).
-    local dir="${TMPDIR:-/tmp}/devstack-$(id -u)"
+    local dir
+    dir="${TMPDIR:-/tmp}/devstack-$(id -u)"
     local err=""
     if [[ -L $dir ]]; then
         err="el directorio de estado $dir es un symlink"
@@ -103,7 +104,7 @@ runtime_base() {
         printf '\033[1;31m[error]\033[0m %s: borralo y reintentá\n' "$err" >&2
         exit 1
     fi
-    mkdir -p -m 700 "$dir" 2>/dev/null || {
+    mkdir -p "$dir" 2>/dev/null || {
         printf '\033[1;31m[error]\033[0m no pude crear el directorio de estado %s\n' "$dir" >&2
         exit 1
     }
@@ -1060,7 +1061,7 @@ svc_up() {
     create=$(svc_field "$id" create)
     if [[ $create == true ]]; then
         [[ -L $dir ]] && die "El directorio de $label es un symlink: $dir"
-        mkdir -p -m 700 "$dir" || die "No pude crear el directorio de $label: $dir"
+        mkdir -p "$dir" || die "No pude crear el directorio de $label: $dir"
         [[ -O $dir ]] || die "$dir no es mío; no escribo ahí"
         chmod 700 "$dir" 2>/dev/null || true
     fi
